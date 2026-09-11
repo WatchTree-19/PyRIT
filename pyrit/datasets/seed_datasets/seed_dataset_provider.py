@@ -225,12 +225,7 @@ class SeedDatasetProvider(ABC):
             if filter_vals is None:
                 continue
 
-            # `meta_vals is None` means the dataset never declared this axis, which
-            # is not the same as declaring it and matching. Skipping here dropped
-            # the filtered axis entirely, so every dataset silent on that axis came
-            # back as a match. It also disagreed with get_all_dataset_names_async,
-            # which excludes datasets carrying no metadata at all - a dataset with
-            # partial metadata was treated as better qualified than one with none.
+            # A requested axis cannot match metadata that does not declare it.
             if meta_vals is None:
                 return False
 

@@ -396,8 +396,8 @@ class TestMetadataParsingRemote:
             dataset_filter=SeedDatasetFilter(modalities={"audio"}, strict_match=True),
         )
 
-    def test_undeclared_axis_does_not_mask_a_declared_mismatch(self):
-        """Two filtered axes, one declared and mismatching: still no match."""
+    def test_undeclared_axis_does_not_match_when_another_axis_matches(self):
+        """An undeclared axis fails even when another filtered axis matches."""
         metadata = SeedDatasetMetadata(modalities={"text"})
         assert not SeedDatasetProvider._match_filter_to_metadata(
             metadata=metadata,
