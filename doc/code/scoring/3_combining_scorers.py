@@ -42,7 +42,9 @@
 #         INV["TrueFalseInverterScorer<br/>negates one result"]
 #         CONV["create_conversation_scorer()<br/>scores concatenated history"]
 #         THRESH["FloatScaleThresholdScorer<br/>score ≥ threshold"]
+#         FALL["FloatScaleFallbackScorer<br/>routes abstentions to a second scorer"]
 #         CONV ~~~ THRESH
+#         THRESH ~~~ FALL
 #     end
 #
 #     subgraph outputs["Resulting scorer kind"]
@@ -76,8 +78,10 @@
 # `TrueFalseCompositeScorer` requires at least one `TrueFalseScorer` and combines their
 # single results with `AND`, `OR`, or `MAJORITY`; `TrueFalseInverterScorer` accepts one
 # `TrueFalseScorer`. `FloatScaleThresholdScorer` is the cross-kind adapter: it accepts one
-# `FloatScaleScorer` and produces a `TrueFalseScorer`. These generic wrappers forward the
-# same `Scorable` to their children, so each child must support that evidence kind.
+# `FloatScaleScorer` and produces a `TrueFalseScorer`. `FloatScaleFallbackScorer` accepts two
+# `FloatScaleScorer`s and produces a `FloatScaleScorer`: the primary is tried first and the
+# fallback only when the primary abstains. These generic wrappers forward the same
+# `Scorable` to their children, so each child must support that evidence kind.
 #
 # `create_conversation_scorer()` accepts a true/false or float-scale scorer that supports
 # text `ContentScorable` evidence. It returns a dynamic wrapper that remains the same scorer
@@ -156,6 +160,32 @@ original = (await copied_enough.score_text_async(text="Solar panels convert sunl
 
 print(f"[threshold] near-copy   -> {near_copy.get_value()}")
 print(f"[threshold] independent -> {original.get_value()}")
+
+# %% [markdown]
+# ## Routing abstentions to a fallback scorer
+#
+# Some float-scale scorers decline to call a response and return an undetermined score,
+# for instance a classifier whose calibrated probability falls inside an abstain band. An
+# abstention is only useful if a caller does something with it. `FloatScaleFallbackScorer`
+# is that caller: it scores with the primary first, and only when the primary abstains does
+# it score again with the fallback and return that result instead. The usual pairing is a
+# cheap, fast primary that handles the bulk of responses and an LLM judge as the fallback,
+# so the judge's cost is paid only on the uncertain tail.
+#
+# ```python
+# from pyrit.score import FloatScaleFallbackScorer, SelfAskLikertScorer
+#
+# routed = FloatScaleFallbackScorer(
+#     scorer=fast_classifier,  # returns UNDETERMINED inside its abstain band
+#     fallback_scorer=SelfAskLikertScorer(chat_target=judge_target, likert_scale=HARM_SCALE),
+# )
+# ```
+#
+# Every score the wrapper returns records which scorer produced it in
+# `score_metadata["resolved_by"]`. When the fallback produced it, the primary's rationale is
+# kept in `score_metadata["primary_rationale"]` and the primary's own metadata is merged in,
+# so nothing the primary said is lost. If the fallback abstains too, the returned score is
+# undetermined and its rationale says both scorers declined.
 
 # %% [markdown]
 # ## Scoring a whole conversation

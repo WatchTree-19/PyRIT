@@ -17,6 +17,7 @@ if TYPE_CHECKING:
     from pyrit.score.conversation_scorer import ConversationScorer, create_conversation_scorer
     from pyrit.score.float_scale.audio_float_scale_scorer import AudioFloatScaleScorer
     from pyrit.score.float_scale.azure_content_filter_scorer import AzureContentFilterScorer
+    from pyrit.score.float_scale.float_scale_fallback_scorer import FloatScaleFallbackScorer
     from pyrit.score.float_scale.float_scale_score_aggregator import (
         FloatScaleScoreAggregator,
         FloatScaleScorerAllCategories,
@@ -156,6 +157,7 @@ _LAZY_EXPORTS: dict[str, str | tuple[str, str | None]] = {
     "FloatScaleScoreAggregator": "pyrit.score.float_scale.float_scale_score_aggregator",
     "FloatScaleScorerAllCategories": "pyrit.score.float_scale.float_scale_score_aggregator",
     "FloatScaleScorerByCategory": "pyrit.score.float_scale.float_scale_score_aggregator",
+    "FloatScaleFallbackScorer": "pyrit.score.float_scale.float_scale_fallback_scorer",
     "FloatScaleScorer": "pyrit.score.float_scale.float_scale_scorer",
     "MessageFloatScaleScorer": "pyrit.score.float_scale.float_scale_scorer",
     "MessageTrueFalseScorer": "pyrit.score.true_false.true_false_scorer",
