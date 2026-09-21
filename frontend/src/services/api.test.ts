@@ -20,7 +20,9 @@ import {
   versionApi,
   configurationApi,
   targetsApi,
+  convertersApi,
   attacksApi,
+  labelsApi,
   scenariosApi,
 } from "./api";
 
@@ -244,6 +246,15 @@ describe("api service", () => {
   });
 
   describe("targetsApi", () => {
+    it("should list target types from registry metadata", async () => {
+      const response = { data: { items: [] } };
+      (apiClient.get as jest.Mock).mockResolvedValueOnce(response);
+
+      await expect(targetsApi.listTargetTypes()).resolves.toEqual(response.data);
+
+      expect(apiClient.get).toHaveBeenCalledWith("/targets/types");
+    });
+
     it("should list targets with default params", async () => {
       const mockResponse = {
         data: {
@@ -321,6 +332,58 @@ describe("api service", () => {
       (apiClient.get as jest.Mock).mockRejectedValueOnce(error);
 
       await expect(targetsApi.listTargets()).rejects.toThrow("Server error");
+    });
+  });
+
+  describe("convertersApi", () => {
+    it("should list converter types from registry metadata", async () => {
+      const response = { data: { items: [] } };
+      (apiClient.get as jest.Mock).mockResolvedValueOnce(response);
+
+      await expect(convertersApi.listConverterTypes()).resolves.toEqual(response.data);
+
+      expect(apiClient.get).toHaveBeenCalledWith("/converters/types");
+    });
+
+    it("should list configured converter instances", async () => {
+      const response = { data: { items: [] } };
+      (apiClient.get as jest.Mock).mockResolvedValueOnce(response);
+
+      await expect(convertersApi.listConverters()).resolves.toEqual(response.data);
+
+      expect(apiClient.get).toHaveBeenCalledWith("/converters");
+    });
+
+    it("should create a named converter instance", async () => {
+      const request = {
+        name: "caesar-custom",
+        type: "CaesarConverter",
+        params: { caesar_offset: "5" },
+      };
+      const response = {
+        data: {
+          converter_id: "caesar-custom",
+          identifier: {
+            class_name: "CaesarConverter",
+            class_module: "pyrit.converter",
+            hash: "hash",
+            pyrit_version: "0.0.0",
+          },
+        },
+      };
+      (apiClient.post as jest.Mock).mockResolvedValueOnce(response);
+
+      await expect(convertersApi.createConverter(request)).resolves.toEqual(response.data);
+
+      expect(apiClient.post).toHaveBeenCalledWith("/converters", request);
+    });
+
+    it("should delete an encoded converter registry name", async () => {
+      (apiClient.delete as jest.Mock).mockResolvedValueOnce({ status: 204 });
+
+      await expect(convertersApi.deleteConverter("custom/name")).resolves.toBeUndefined();
+
+      expect(apiClient.delete).toHaveBeenCalledWith("/converters/custom%2Fname");
     });
   });
 
@@ -542,6 +605,34 @@ describe("api service", () => {
 
       expect(apiClient.get).toHaveBeenCalledWith("/attacks", {
         params: { limit: 10, outcome: "success" },
+        paramsSerializer: {
+          indexes: null,
+        },
+      });
+    });
+
+    it("should get narrowed labels with repeated query parameters", async () => {
+      const mockResponse = {
+        data: {
+          source: "attacks",
+          labels: { team: ["red"] },
+        },
+      };
+      (apiClient.get as jest.Mock).mockResolvedValueOnce(mockResponse);
+
+      await labelsApi.getLabels("attacks", {
+        operator: ["alice", "bob"],
+        operation: ["nightly"],
+        label: ["team:red"],
+      });
+
+      expect(apiClient.get).toHaveBeenCalledWith("/labels", {
+        params: {
+          source: "attacks",
+          operator: ["alice", "bob"],
+          operation: ["nightly"],
+          label: ["team:red"],
+        },
         paramsSerializer: {
           indexes: null,
         },
