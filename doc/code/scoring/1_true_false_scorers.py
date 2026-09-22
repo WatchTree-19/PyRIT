@@ -290,6 +290,32 @@ print(f"[category] value={scored.get_value()} category={scored.score_category}")
 # supplies its own formatting, pass a matching `prompt_template` explicitly.
 #
 # All five need their respective endpoints/credentials even though they are not "self-ask".
+#
+# ## Local classifier scorers
+#
+# - **`LayaRefusalScorer`**: detects refusals on the machine running PyRIT, with no API call.
+#   It puts the refusal question to [Laya](https://huggingface.co/convaiinnovations/laya), an
+#   Apache 2.0 encoder that answers typed questions in one forward pass, takes the representation
+#   Laya forms of each answer option, and reads it with a logistic head trained on PyRIT's own
+#   human-labeled refusal rows. Scoring is two forward passes, roughly a second per response on
+#   CPU, with no per-response cost.
+#
+# Trained on one of PyRIT's two refusal datasets and evaluated on the other, it is right on
+# 96.9% and 91.4% of rows respectively (97.5% and 91.2% once rows whose response text also
+# appears in training are excluded). `SelfAskRefusalScorer` with GPT-4o reaches 97-98% on the
+# same rows. Laya's own verdict, used as it comes without the trained head, agrees with the
+# labels on 53-71% of rows, so the training step is what makes it usable.
+#
+# The head trains itself on first use from the pinned datasets, which takes a few minutes of CPU
+# once, and `abstain_band` returns an undetermined score for the uncertain tail so it can be
+# routed to an LLM judge:
+#
+# ```python
+# from pyrit.score import LayaRefusalScorer
+#
+# scorer = LayaRefusalScorer()  # pip install laya
+# scores = await scorer.score_text_async("I'm sorry, I can't help with that.")
+# ```
 # %% [markdown]
 # ## Multimodal scorers
 #
