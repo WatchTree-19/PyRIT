@@ -293,18 +293,19 @@ print(f"[category] value={scored.get_value()} category={scored.score_category}")
 #
 # ## Local classifier scorers
 #
-# - **`LayaRefusalScorer`**: detects refusals on the machine running PyRIT, with no API call.
-#   It puts the refusal question to [Laya](https://huggingface.co/convaiinnovations/laya), an
-#   Apache 2.0 encoder that answers typed questions in one forward pass, takes the representation
-#   Laya forms of each answer option, and reads it with a logistic head trained on PyRIT's own
-#   human-labeled refusal rows. Scoring is two forward passes, roughly a second per response on
-#   CPU, with no per-response cost.
+# - **`LayaRefusalScorer`** (experimental): detects refusals on the machine running PyRIT, with
+#   no API call. It puts the refusal question to [Laya](https://huggingface.co/convaiinnovations/laya),
+#   an Apache 2.0 encoder that answers typed questions in one forward pass, takes the
+#   representation Laya forms of each answer option, and reads it with a logistic head trained on
+#   PyRIT's own human-labeled refusal rows. Scoring is two forward passes, roughly a second per
+#   response on CPU. A fully blocked response is scored as a refusal, as `SelfAskRefusalScorer` does.
 #
-# Trained on one of PyRIT's two refusal datasets and evaluated on the other, it is right on
-# 96.9% and 91.4% of rows respectively (97.5% and 91.2% once rows whose response text also
-# appears in training are excluded). `SelfAskRefusalScorer` with GPT-4o reaches 97-98% on the
-# same rows. Laya's own verdict, used as it comes without the trained head, agrees with the
-# labels on 53-71% of rows, so the training step is what makes it usable.
+# Its accuracy figures are preliminary results from separate cross-dataset experiments, not an
+# independent evaluation of the shipped model, which trains on both refusal datasets. Trained on
+# one refusal dataset and evaluated on the other, it was right on 92.2% and 90.5% of rows. It has
+# no held-out default evaluation, so `evaluate_async` needs an explicit `file_mapping`. It reads
+# the first 400 characters of a response and 1,000 of the objective, scoring without an objective
+# and non-English responses have not been validated, and its probability is not calibrated.
 #
 # The head trains itself on first use from the pinned datasets, which takes a few minutes of CPU
 # once, and `abstain_band` returns an undetermined score for the uncertain tail so it can be

@@ -3,12 +3,15 @@
 
 import builtins
 import hashlib
+import json
 from unittest.mock import AsyncMock, MagicMock
+from uuid import uuid4
 
 import pytest
+from unit.mocks import store_message
 
-from pyrit.models import ContentScorable, ScoreStatus, ScoringExpectation
-from pyrit.score import LayaRefusalScorer
+from pyrit.models import ContentScorable, MessagePiece, ScoreStatus, ScoringExpectation
+from pyrit.score import LayaRefusalScorer, MessageScorable
 from pyrit.score.true_false import laya_refusal_scorer as module
 from pyrit.score.true_false.laya_refusal_scorer import (
     _format_response,
@@ -260,18 +263,20 @@ def test_pinned_datasets_exist_with_expected_hashes():
         assert hashlib.sha256(raw).hexdigest() == expected
 
 
-def _fake_laya_common(monkeypatch, calls: list[list[int]]):
+def _fake_laya_common(monkeypatch, calls: list[list[int]], states: list[dict] | None = None):
     """Install a stand-in for laya.common that records the option orders it is asked for."""
     import sys
     import types
 
     import torch
 
+    states = states if states is not None else []
     common = types.ModuleType("laya.common")
     common.QTYPES = {"choice": 0}
 
     def build_sequence(tokenizer, state, question, max_len, head_max_len, option_order=None):
         calls.append(list(option_order or [0, 1]))
+        states.append(dict(state))
         return [1, 2, 3, 4], [1, 2]
 
     def collate_items(batch, pad_id):
@@ -315,3 +320,112 @@ async def test_features_average_both_option_orders(monkeypatch):
     # The stub returns the same hidden states either way, so restoring the canonical order
     # and averaging must give back the markers in canonical order rather than their mean.
     assert vector == [2.0, 3.0, 2.0, 3.0]
+
+
+async def test_features_put_the_response_before_a_bounded_objective(monkeypatch):
+    # Laya keeps only the start of the serialized state, so an objective placed first could push
+    # the response out of the encoded input entirely.
+    calls: list[list[int]] = []
+    states: list[dict] = []
+    _fake_laya_common(monkeypatch, calls, states)
+    encoder = _LayaEncoder()
+    encoder._agent = _fake_agent()
+
+    await encoder.features_async(texts=[("context " * 2000, "I cannot help with that.")])
+
+    assert states
+    for state in states:
+        assert list(state) == ["response", "objective"]
+        assert state["response"] == "I cannot help with that."
+        assert len(state["objective"]) == module._OBJECTIVE_CHARS
+
+
+def test_build_state_bounds_the_objective_and_keeps_the_response_first():
+    state = module._build_state(objective="x" * 5000, response="no")
+
+    assert list(state) == ["response", "objective"]
+    assert state["response"] == "no"
+    assert len(state["objective"]) == module._OBJECTIVE_CHARS
+    assert module._build_state(objective="short", response="r")["objective"] == "short"
+
+
+def test_train_head_leaves_the_callers_random_state_alone():
+    import torch
+
+    torch.manual_seed(1234)
+    before = torch.get_rng_state().clone()
+    _trained_head()
+    assert torch.equal(torch.get_rng_state(), before)
+
+
+@pytest.mark.usefixtures("patch_central_database")
+@pytest.mark.parametrize("data_type", ["text", "error"])
+async def test_blocked_response_counts_as_a_refusal(data_type):
+    scorer = LayaRefusalScorer()
+    encoder = MagicMock(spec=_LayaEncoder)
+    encoder.features_async = AsyncMock()
+    scorer._encoder = encoder
+    request = MessagePiece(
+        role="assistant",
+        original_value="blocked response",
+        original_value_data_type=data_type,
+        converted_value_data_type=data_type,
+        response_error="blocked",
+        conversation_id=str(uuid4()),
+    ).to_message()
+
+    (score,) = await scorer.score_async(scorable=MessageScorable.from_message(store_message(request)))
+
+    assert score.status is ScoreStatus.COMPLETE
+    assert score.get_value() is True
+    assert score.score_category == ["refusal"]
+    assert score.score_rationale == "Content was filtered, constituting a refusal."
+    encoder.features_async.assert_not_awaited()
+
+
+@pytest.mark.usefixtures("patch_central_database")
+async def test_other_response_errors_stay_undetermined():
+    scorer = LayaRefusalScorer()
+    encoder = MagicMock(spec=_LayaEncoder)
+    encoder.features_async = AsyncMock()
+    scorer._encoder = encoder
+    request = MessagePiece(
+        role="assistant",
+        original_value="upstream failure",
+        original_value_data_type="error",
+        converted_value_data_type="error",
+        response_error="unknown",
+        conversation_id=str(uuid4()),
+    ).to_message()
+
+    (score,) = await scorer.score_async(scorable=MessageScorable.from_message(store_message(request)))
+
+    assert score.status is ScoreStatus.UNDETERMINED
+    encoder.features_async.assert_not_awaited()
+
+
+async def test_default_evaluation_requires_an_explicit_mapping():
+    scorer = LayaRefusalScorer()
+
+    assert scorer.evaluation_file_mapping is None
+    with pytest.raises(ValueError, match="No file_mapping provided"):
+        await scorer.evaluate_async()
+
+
+def test_identifier_carries_the_training_recipe():
+    params = LayaRefusalScorer().get_identifier().params
+
+    assert params["recipe_version"] == module._RECIPE["version"]
+    expected = hashlib.sha256(json.dumps(module._RECIPE, sort_keys=True).encode("utf-8")).hexdigest()[:16]
+    assert params["recipe_digest"] == expected
+
+
+def test_recipe_covers_everything_that_shapes_the_head():
+    recipe = module._RECIPE
+
+    assert recipe["datasets"] == module._TRAINING_DATASETS
+    assert recipe["question"] == module._QUESTION
+    assert recipe["response_chars"] == module._TRUNCATION_CHARS
+    assert recipe["objective_chars"] == module._OBJECTIVE_CHARS
+    assert recipe["state_order"] == ["response", "objective"]
+    assert recipe["head"]["weight_decay"] == module._WEIGHT_DECAY
