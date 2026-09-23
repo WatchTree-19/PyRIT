@@ -3,6 +3,7 @@
 
 import builtins
 import hashlib
+import importlib.util
 import json
 from unittest.mock import AsyncMock, MagicMock
 from uuid import uuid4
@@ -19,6 +20,12 @@ from pyrit.score.true_false.laya_refusal_scorer import (
     _load_training_rows,
     _predict_probability,
     _train_head,
+)
+
+# The dev install has no torch; these tests fit the real head or build real tensors, so they run
+# wherever torch is installed (the dev_all matrix and the huggingface extra).
+requires_torch = pytest.mark.skipif(
+    importlib.util.find_spec("torch") is None, reason="LayaRefusalScorer needs torch for its head"
 )
 
 
@@ -79,6 +86,7 @@ def test_compute_dataset_hashes_matches_pins():
     assert LayaRefusalScorer.compute_dataset_hashes() == module._TRAINING_DATASETS
 
 
+@requires_torch
 def test_train_head_is_deterministic_and_separates():
     first, second = _trained_head(), _trained_head()
 
@@ -89,6 +97,7 @@ def test_train_head_is_deterministic_and_separates():
     assert _predict_probability(head=first, features=features[1]) < 0.1
 
 
+@requires_torch
 def test_predict_probability_is_a_probability():
     head = _trained_head()
 
@@ -101,6 +110,7 @@ def test_invalid_abstain_band_raises(band):
         LayaRefusalScorer(abstain_band=band)
 
 
+@requires_torch
 @pytest.mark.usefixtures("patch_central_database")
 async def test_score_async_returns_refusal_outside_band():
     features, _ = _separable_training_data()
@@ -114,6 +124,7 @@ async def test_score_async_returns_refusal_outside_band():
     assert score.score_metadata["refusal_probability"] > 0.8
 
 
+@requires_torch
 @pytest.mark.usefixtures("patch_central_database")
 async def test_score_async_returns_compliance_outside_band():
     features, _ = _separable_training_data()
@@ -126,6 +137,7 @@ async def test_score_async_returns_compliance_outside_band():
     assert score.score_metadata["refusal_probability"] < 0.2
 
 
+@requires_torch
 @pytest.mark.usefixtures("patch_central_database")
 async def test_score_async_abstains_inside_band():
     # A feature vector between the two training clusters lands near 0.5.
@@ -140,6 +152,7 @@ async def test_score_async_abstains_inside_band():
     assert 0.1 <= score.score_metadata["refusal_probability"] <= 0.9
 
 
+@requires_torch
 @pytest.mark.usefixtures("patch_central_database")
 async def test_score_async_with_band_disabled_never_abstains():
     scorer = _scorer_with_mocks(features=[0.0, 0.0, 0.1], abstain_band=None)
@@ -150,6 +163,7 @@ async def test_score_async_with_band_disabled_never_abstains():
     assert "abstain_band_low" not in score.score_metadata
 
 
+@requires_torch
 @pytest.mark.usefixtures("patch_central_database")
 async def test_score_async_passes_objective_and_truncated_response():
     features, _ = _separable_training_data()
@@ -165,6 +179,7 @@ async def test_score_async_passes_objective_and_truncated_response():
     assert pair[1] == "y" * module._TRUNCATION_CHARS
 
 
+@requires_torch
 @pytest.mark.usefixtures("patch_central_database")
 async def test_score_async_without_objective_passes_empty_string():
     features, _ = _separable_training_data()
@@ -176,6 +191,7 @@ async def test_score_async_without_objective_passes_empty_string():
     assert pair[0] == ""
 
 
+@requires_torch
 @pytest.mark.usefixtures("patch_central_database")
 async def test_load_model_async_trains_once(monkeypatch):
     scorer = LayaRefusalScorer()
@@ -308,6 +324,7 @@ def _fake_agent():
     return agent
 
 
+@requires_torch
 async def test_features_average_both_option_orders(monkeypatch):
     calls: list[list[int]] = []
     _fake_laya_common(monkeypatch, calls)
@@ -322,6 +339,7 @@ async def test_features_average_both_option_orders(monkeypatch):
     assert vector == [2.0, 3.0, 2.0, 3.0]
 
 
+@requires_torch
 async def test_features_put_the_response_before_a_bounded_objective(monkeypatch):
     # Laya keeps only the start of the serialized state, so an objective placed first could push
     # the response out of the encoded input entirely.
@@ -349,6 +367,7 @@ def test_build_state_bounds_the_objective_and_keeps_the_response_first():
     assert module._build_state(objective="short", response="r")["objective"] == "short"
 
 
+@requires_torch
 def test_train_head_leaves_the_callers_random_state_alone():
     import torch
 
