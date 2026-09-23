@@ -10,6 +10,10 @@ from pyrit.output._formatting import _PrettyPrinterMixin
 from pyrit.output.scorer.base import ScorerPrinterBase
 from pyrit.output.sink import Sink
 
+# The evaluator zeroes differences below this as floating-point noise, so a scorer whose MAE
+# matches the constant-guess baseline to within it is treated as a tie, not as beating it.
+_BASELINE_TIE_TOLERANCE = 1e-10
+
 
 class PrettyScorerPrinter(_PrettyPrinterMixin, ScorerPrinterBase):
     """
@@ -244,7 +248,7 @@ class PrettyScorerPrinter(_PrettyPrinterMixin, ScorerPrinterBase):
 
         baseline_mae = getattr(metrics, "baseline_mean_absolute_error", None)
         if baseline_mae is not None:
-            beats_baseline = metrics.mean_absolute_error < baseline_mae
+            beats_baseline = metrics.mean_absolute_error < baseline_mae - _BASELINE_TIE_TOLERANCE
             lines.append(
                 self._format_colored(
                     f"{self._indent * 3}• Constant-Guess Baseline MAE: {baseline_mae:.4f}"
