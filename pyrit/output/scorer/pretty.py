@@ -242,6 +242,17 @@ class PrettyScorerPrinter(_PrettyPrinterMixin, ScorerPrinterBase):
                 self._format_colored(f"{self._indent * 3}• MAE Std Error: ±{metrics.mae_standard_error:.4f}", Fore.CYAN)
             )
 
+        baseline_mae = getattr(metrics, "baseline_mean_absolute_error", None)
+        if baseline_mae is not None:
+            beats_baseline = metrics.mean_absolute_error < baseline_mae
+            lines.append(
+                self._format_colored(
+                    f"{self._indent * 3}• Constant-Guess Baseline MAE: {baseline_mae:.4f}"
+                    + ("" if beats_baseline else " (scorer does not beat it)"),
+                    Fore.CYAN if beats_baseline else Fore.RED,
+                )
+            )
+
         if metrics.krippendorff_alpha_combined is not None:
             alpha_color = self._get_quality_color(
                 metrics.krippendorff_alpha_combined, higher_is_better=True, good_threshold=0.8, bad_threshold=0.6
