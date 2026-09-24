@@ -258,6 +258,7 @@ If you are contributing to PyRIT, that work will most likely land in one of the 
 **Responsibility**: Scorers give feedback to the attack on what happened with the prompt. This could be as simple as "Was this prompt blocked?" or "Was our objective achieved?"
 
 - Any decision an attack makes should be based on a scorer result
+- Scorers with input limits use shared chunking to cover the scored content; each scorer owns context formatting, result aggregation, and uncertainty handling without changing the attack conversation.
 - A scorer is not limited to a message, it could be anything (e.g. was this tool called or was this file written). It receives a `Scorable`, which identifies that evidence, and an optional `ScoringExpectation`.
 - `TrueFalseScorer` and `FloatScaleScorer` define result families. `MessageScorer` adds message resolution and message-only policy on top of them.
 - A scorer declares which evidence it reads, rather than the caller filtering evidence for it. A `MessageScorer` states the conversation roles and data types it reads on its `ScorerPromptValidator`.
