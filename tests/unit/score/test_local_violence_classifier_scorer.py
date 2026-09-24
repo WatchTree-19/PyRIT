@@ -2,6 +2,7 @@
 # Licensed under the MIT license.
 
 import hashlib
+import importlib.util
 import math
 from concurrent.futures import ThreadPoolExecutor
 from functools import cache
@@ -23,6 +24,13 @@ from pyrit.score.float_scale.local_violence_classifier_scorer import (
 )
 
 pytestmark = pytest.mark.usefixtures("patch_central_database")
+
+requires_torch = pytest.mark.skipif(
+    importlib.util.find_spec("torch") is None, reason="LocalViolenceClassifierScorer needs torch for its head"
+)
+requires_transformers = pytest.mark.skipif(
+    importlib.util.find_spec("transformers") is None, reason="the real-tokenizer tests need transformers"
+)
 
 
 def _separable_training_data(rows_per_class: int = 40) -> tuple[list[list[float]], list[int]]:
@@ -102,6 +110,7 @@ def test_load_training_rows_rejects_changed_dataset(tmp_path: Path) -> None:
     assert texts == [] and labels == []
 
 
+@requires_torch
 def test_train_head_is_deterministic_and_separates() -> None:
     embeddings, labels = _separable_training_data()
     first = _train_head(embeddings=embeddings, labels=labels, seed=0)
@@ -118,6 +127,7 @@ def test_train_head_is_deterministic_and_separates() -> None:
     assert positive > 0.5 > negative
 
 
+@requires_torch
 def test_predict_probability_is_a_probability() -> None:
     head = _trained_head()
     probability = _predict_probability(head=head, embedding=[0.0] * 384)
@@ -131,6 +141,7 @@ def test_invalid_abstain_band_raises(band: tuple[float, float]) -> None:
         LocalViolenceClassifierScorer(abstain_band=band)
 
 
+@requires_torch
 @pytest.mark.usefixtures("patch_central_database")
 async def test_score_returns_probability_outside_band_async() -> None:
     embeddings, _ = _separable_training_data()
@@ -146,6 +157,7 @@ async def test_score_returns_probability_outside_band_async() -> None:
     assert score.score_metadata["max_chunk_probability"] == score.get_value()
 
 
+@requires_torch
 @pytest.mark.usefixtures("patch_central_database")
 async def test_score_abstains_inside_band_async() -> None:
     # An all-zero embedding sits between the training clusters, so the calibrated
@@ -163,6 +175,7 @@ async def test_score_abstains_inside_band_async() -> None:
     assert score.score_metadata["abstain_band_high"] == 0.9
 
 
+@requires_torch
 @pytest.mark.usefixtures("patch_central_database")
 async def test_score_with_band_disabled_never_abstains_async() -> None:
     scorer = _scorer_with_mocks(head=_trained_head(), embedding=[0.0] * 384, abstain_band=None)
@@ -173,6 +186,7 @@ async def test_score_with_band_disabled_never_abstains_async() -> None:
     assert 0.0 <= scores[0].get_value() <= 1.0
 
 
+@requires_torch
 @pytest.mark.usefixtures("patch_central_database")
 async def test_score_passes_objective_into_windows_async() -> None:
     embeddings, _ = _separable_training_data()
@@ -263,6 +277,7 @@ def test_long_objective_retains_different_responses() -> None:
     assert list(first) != list(second)
 
 
+@requires_transformers
 @pytest.mark.parametrize("objective", [None, "a short objective"])
 def test_real_tokenizer_short_input_parity(objective: str | None) -> None:
     from transformers import BertTokenizer
@@ -297,6 +312,7 @@ def test_real_tokenizer_short_input_parity(objective: str | None) -> None:
     assert list(windows) == [tokenizer.encode(_format_training_text(objective=objective, response=response))]
 
 
+@requires_transformers
 def test_real_tokenizer_special_tokens_and_full_tail() -> None:
     from transformers import BertTokenizer
 
@@ -435,6 +451,7 @@ def test_abstention_applies_after_maximum(
         assert score.score_value is None
 
 
+@requires_torch
 def test_head_training_and_prediction_preserve_rng() -> None:
     import torch
 
@@ -448,6 +465,7 @@ def test_head_training_and_prediction_preserve_rng() -> None:
     assert all(torch.equal(a, b) for a, b in zip(cuda_states, torch.cuda.get_rng_state_all(), strict=True))
 
 
+@requires_torch
 def test_local_initialization_matches_torch_defaults() -> None:
     import torch
 
@@ -460,6 +478,7 @@ def test_local_initialization_matches_torch_defaults() -> None:
         assert torch.equal(value, actual.state_dict()[key])
 
 
+@requires_torch
 def test_parallel_training_uses_independent_generators() -> None:
     import torch
 
@@ -558,3 +577,221 @@ async def test_readable_partial_block_is_scored_async() -> None:
     with patch.object(scorer, "_score_piece_async", new_callable=AsyncMock, return_value=[]) as score_piece:
         await scorer.score_message_async(message=Message(message_pieces=[piece]))
     score_piece.assert_awaited_once()
+
+
+# --- Embedder plumbing, exercised with stand-ins instead of the pinned model ---
+
+
+class _FakeBatch(dict):
+    """Tokenizer output that records the device it was moved to."""
+
+    def to(self, device: str) -> "_FakeBatch":
+        self.device = device
+        return self
+
+
+class _FakeEncoder:
+    """Encoder whose CLS vector is the first input id repeated, so every row normalizes the same way."""
+
+    def __init__(self) -> None:
+        self.batch_sizes: list[int] = []
+
+    def __call__(self, **encoded: object) -> MagicMock:
+        import torch
+
+        input_ids = encoded["input_ids"]
+        assert isinstance(input_ids, torch.Tensor)
+        self.batch_sizes.append(input_ids.shape[0])
+        hidden = input_ids.float().unsqueeze(-1).repeat(1, 1, 2)
+        return MagicMock(last_hidden_state=hidden)
+
+
+class _PaddingTokenizer:
+    """Pads to the longest row and encodes text as its length plus one."""
+
+    def pad(self, features: dict, **kwargs: object) -> _FakeBatch:
+        import torch
+
+        assert kwargs == {"padding": True, "return_attention_mask": True, "return_tensors": "pt"}
+        rows = features["input_ids"]
+        width = max(len(row) for row in rows)
+        ids = [row + [0] * (width - len(row)) for row in rows]
+        mask = [[1] * len(row) + [0] * (width - len(row)) for row in rows]
+        return _FakeBatch(input_ids=torch.tensor(ids), attention_mask=torch.tensor(mask))
+
+    def __call__(self, texts: list[str], **kwargs: object) -> _FakeBatch:
+        import torch
+
+        assert kwargs["truncation"] is True and kwargs["max_length"] == _BgeSmallEmbedder.MAX_LENGTH
+        return _FakeBatch(input_ids=torch.tensor([[len(text) + 1, 1] for text in texts]))
+
+
+def _loaded_fake_embedder() -> tuple[_BgeSmallEmbedder, _FakeEncoder]:
+    embedder = _BgeSmallEmbedder()
+    encoder = _FakeEncoder()
+    embedder._tokenizer = _PaddingTokenizer()
+    embedder._model = encoder
+    embedder._device = "cpu"
+    return embedder, encoder
+
+
+async def test_embedder_loads_the_model_once_async() -> None:
+    embedder = _BgeSmallEmbedder()
+
+    def fake_load() -> None:
+        embedder._model, embedder._tokenizer = object(), object()
+
+    assert not embedder._is_loaded
+    with patch.object(embedder, "_load_model", side_effect=fake_load) as load:
+        await embedder.load_model_async()
+        await embedder.load_model_async()
+    assert load.call_count == 1
+    assert embedder._is_loaded
+
+
+async def test_embed_async_skips_empty_input_and_delegates_async() -> None:
+    embedder = _BgeSmallEmbedder()
+    with (
+        patch.object(embedder, "load_model_async", AsyncMock()) as load,
+        patch.object(embedder, "_embed", return_value=[[1.0]]) as embed,
+    ):
+        assert await embedder.embed_async(texts=[]) == []
+        load.assert_not_awaited()
+        assert await embedder.embed_async(texts=("only",)) == [[1.0]]
+    load.assert_awaited_once()
+    embed.assert_called_once_with(["only"])
+
+
+async def test_predict_response_async_loads_then_delegates_async() -> None:
+    embedder = _BgeSmallEmbedder()
+    head = MagicMock(spec=module._TrainedHead)
+    expected = _ChunkPrediction(probability=0.4, chunk_count=2, objective_truncated=False)
+    settings = {"max_input_tokens": 64, "chunk_overlap_tokens": 4, "max_objective_tokens": 8}
+    with (
+        patch.object(embedder, "load_model_async", AsyncMock()) as load,
+        patch.object(embedder, "_predict_response", return_value=expected) as predict,
+    ):
+        result = await embedder.predict_response_async(head=head, objective="o", response="r", **settings)
+    assert result is expected
+    load.assert_awaited_once()
+    predict.assert_called_once_with(head=head, objective="o", response="r", **settings)
+
+
+def test_response_windows_require_a_loaded_tokenizer() -> None:
+    with pytest.raises(RuntimeError, match="tokenizer is not loaded"):
+        _BgeSmallEmbedder()._response_windows(
+            objective=None, response="r", max_input_tokens=64, chunk_overlap_tokens=4, max_objective_tokens=8
+        )
+
+
+def test_response_windows_require_cls_and_sep_tokens() -> None:
+    embedder = _embedder_with_tokenizer()
+    embedder._tokenizer.sep_token_id = None
+    with pytest.raises(ValueError, match="CLS and SEP"):
+        embedder._response_windows(
+            objective=None, response="r", max_input_tokens=64, chunk_overlap_tokens=4, max_objective_tokens=8
+        )
+
+
+@requires_torch
+def test_embed_token_ids_pads_moves_and_normalizes() -> None:
+    embedder, encoder = _loaded_fake_embedder()
+    embeddings = embedder._embed_token_ids([[5, 9, 6], [5, 6]])
+    assert encoder.batch_sizes == [2]
+    for embedding in embeddings:
+        assert embedding == pytest.approx([2**-0.5, 2**-0.5])
+
+
+@requires_torch
+def test_embed_batches_and_normalizes() -> None:
+    embedder, encoder = _loaded_fake_embedder()
+    texts = [f"text {i}" for i in range(_BgeSmallEmbedder.BATCH_SIZE + 8)]
+    embeddings = embedder._embed(texts)
+    assert encoder.batch_sizes == [_BgeSmallEmbedder.BATCH_SIZE, 8]
+    assert len(embeddings) == len(texts)
+    assert all(embedding == pytest.approx([2**-0.5, 2**-0.5]) for embedding in embeddings)
+
+
+@requires_torch
+@pytest.mark.parametrize("method", ["_embed_token_ids", "_embed"])
+def test_embedding_requires_a_loaded_model(method: str) -> None:
+    argument = [[5, 6]] if method == "_embed_token_ids" else ["text"]
+    with pytest.raises(RuntimeError, match="model is not loaded"):
+        getattr(_BgeSmallEmbedder(), method)(argument)
+
+
+@requires_torch
+@requires_transformers
+@pytest.mark.parametrize(("requested", "expected"), [(None, "cpu"), ("cuda:1", "cuda:1")])
+def test_load_model_pins_the_revision_and_picks_a_device(requested: str | None, expected: str) -> None:
+    tokenizer = object()
+    model = MagicMock()
+    model.to.return_value = model
+    embedder = _BgeSmallEmbedder(device=requested)
+    with (
+        patch("transformers.AutoTokenizer.from_pretrained", return_value=tokenizer) as load_tokenizer,
+        patch("transformers.AutoModel.from_pretrained", return_value=model) as load_model,
+        patch("torch.cuda.is_available", return_value=False),
+    ):
+        embedder._load_model()
+    pinned = {"revision": _BgeSmallEmbedder.DEFAULT_MODEL_REVISION}
+    load_tokenizer.assert_called_once_with(_BgeSmallEmbedder.DEFAULT_MODEL_ID, **pinned)
+    load_model.assert_called_once_with(_BgeSmallEmbedder.DEFAULT_MODEL_ID, **pinned)
+    model.to.assert_called_once_with(expected)
+    model.eval.assert_called_once_with()
+    assert embedder._tokenizer is tokenizer and embedder._model is model and embedder._device == expected
+
+
+def test_load_model_explains_the_missing_extra() -> None:
+    with patch.dict("sys.modules", {"transformers": None}), pytest.raises(RuntimeError, match="huggingface"):
+        _BgeSmallEmbedder()._load_model()
+
+
+def test_load_training_rows_skips_rows_without_scores_or_response(tmp_path: Path) -> None:
+    body = (
+        b"# dataset_version=1.0\n"
+        b"objective,assistant_response,human_score_1\n"
+        b"kept,a violent answer,1.0\n"
+        b"no score,an answer,\n"
+        b"no response,,0.0\n"
+    )
+    (tmp_path / "violence.csv").write_bytes(body)
+    with (
+        patch.object(module, "_HARM_EVALS_PATH", tmp_path),
+        patch.object(module, "_TRAINING_DATASETS", {"violence.csv": hashlib.sha256(body).hexdigest()}),
+    ):
+        texts, labels = _load_training_rows()
+    assert texts == [_format_training_text(objective="kept", response="a violent answer")]
+    assert labels == [1]
+
+
+@requires_torch
+def test_predict_probability_rejects_a_non_finite_head() -> None:
+    import torch
+
+    head = module._TrainedHead(
+        feature_mean=(0.0,) * 384,
+        feature_std=(1.0,) * 384,
+        network=lambda features: torch.full((features.shape[0], 1), float("nan")),
+        temperature=1.0,
+        training_rows=1,
+    )
+    with pytest.raises(ValueError, match="non-finite"):
+        _predict_probability(head=head, embedding=[0.0] * 384)
+
+
+async def test_scorer_trains_its_head_once_async() -> None:
+    scorer = LocalViolenceClassifierScorer()
+    head = MagicMock(spec=module._TrainedHead, training_rows=2, temperature=1.0)
+    scorer._embedder = MagicMock(spec=_BgeSmallEmbedder)
+    scorer._embedder.embed_async = AsyncMock(return_value=[[0.0], [1.0]])
+    with (
+        patch.object(module, "_load_training_rows", return_value=(["a", "b"], [0, 1])) as load_rows,
+        patch.object(module, "_train_head", return_value=head) as train,
+    ):
+        await scorer.load_model_async()
+        await scorer.load_model_async()
+    load_rows.assert_called_once_with()
+    scorer._embedder.embed_async.assert_awaited_once_with(texts=["a", "b"])
+    train.assert_called_once_with(embeddings=[[0.0], [1.0]], labels=[0, 1], seed=scorer._seed)
+    assert scorer._head is head
