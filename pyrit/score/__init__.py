@@ -80,7 +80,6 @@ if TYPE_CHECKING:
     from pyrit.score.true_false.float_scale_threshold_scorer import FloatScaleThresholdScorer
     from pyrit.score.true_false.gandalf_scorer import GandalfScorer
     from pyrit.score.true_false.garak_exploitation_scorer import GarakExploitationDetector, GarakExploitationScorer
-    from pyrit.score.true_false.laya_refusal_scorer import LayaRefusalScorer
     from pyrit.score.true_false.llamaguard_parser import LLAMAGUARD_3_CATEGORY_CODES, parse_llamaguard_response
     from pyrit.score.true_false.llamaguard_policy import LlamaGuardCategory, LlamaGuardPolicy
     from pyrit.score.true_false.llamaguard_scorer import (
@@ -88,6 +87,7 @@ if TYPE_CHECKING:
         LlamaGuardScorer,
         render_llamaguard_prompt,
     )
+    from pyrit.score.true_false.local_refusal_classifier_scorer import LocalRefusalClassifierScorer
     from pyrit.score.true_false.manual_scorer import ManualScorer
     from pyrit.score.true_false.otel_tool_call_scorer import OtelToolCallScorer
     from pyrit.score.true_false.prompt_shield_scorer import PromptShieldScorer
@@ -191,7 +191,7 @@ _LAZY_EXPORTS: dict[str, str | tuple[str, str | None]] = {
     "TraceAcquisitionError": "pyrit.score.observation.trace_client",
     "TraceClient": "pyrit.score.observation.trace_client",
     "JsonSchemaResponseHandler": "pyrit.score.response_handler",
-    "LayaRefusalScorer": "pyrit.score.true_false.laya_refusal_scorer",
+    "LocalRefusalClassifierScorer": "pyrit.score.true_false.local_refusal_classifier_scorer",
     "LDAPInjectionOutputScorer": "pyrit.score.true_false.regex.ldap_injection_output_scorer",
     "LikertScaleEvalFiles": "pyrit.score.float_scale.self_ask_likert_scorer",
     "LikertScale": "pyrit.score.float_scale.likert_scale",
