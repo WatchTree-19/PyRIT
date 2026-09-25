@@ -702,7 +702,7 @@ class TestAdversarialReplyParsedConsistentlyAcrossAttacks:
 
 
 # Adversarial system prompts routed through ``_AdversarialConversationManager`` but not exposed via a
-# ``*SystemPromptPaths`` enum: the SimulatedConversation crescendo personas (each drives an inner
+# ``*SystemPromptPaths`` enum: SimulatedConversation crescendo personas (each drives an inner
 # ``RedTeamingAttack`` whose adversarial system prompt is the YAML) and the scam-scenario persuasion
 # persona (set as ``AttackAdversarialConfig.system_prompt``).
 _NON_ENUM_ADVERSARIAL_SYSTEM_PROMPTS = [
@@ -946,13 +946,13 @@ class TestPrependedConversationInMemory:
             next_message=multimodal_text_message,  # Required when prepended_conversation is provided
         )
 
-        # TAP prunes all branches with these mocks, so result.conversation_id is empty. The prepended
-        # messages were duplicated into the single node conversation; resolve that id from memory.
-        assert not result.conversation_id
+        # next_message is sent on the first live turn and scored as a success, so the result points at
+        # the single node conversation that holds the prepended messages.
+        assert result.conversation_id
         memory = CentralMemory.get_memory_instance()
         node_conversation_ids = {piece.conversation_id for piece in memory.get_message_pieces()}
-        assert len(node_conversation_ids) == 1, f"Expected one conversation in memory, got {node_conversation_ids}"
-        conversation = list(memory.get_conversation_messages(conversation_id=node_conversation_ids.pop()))
+        assert node_conversation_ids == {result.conversation_id}
+        conversation = list(memory.get_conversation_messages(conversation_id=result.conversation_id))
 
         # Should have exactly the prepended messages in memory (mock normalizer doesn't add responses)
         assert len(conversation) == 2, f"Expected exactly 2 prepended messages, got {len(conversation)}"
