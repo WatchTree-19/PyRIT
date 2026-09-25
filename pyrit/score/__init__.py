@@ -140,6 +140,7 @@ if TYPE_CHECKING:
     from pyrit.score.true_false.shieldgemma_scorer import ShieldGemmaScorer, render_shieldgemma_prompt
     from pyrit.score.true_false.substring_scorer import SubStringScorer
     from pyrit.score.true_false.true_false_composite_scorer import TrueFalseCompositeScorer
+    from pyrit.score.true_false.true_false_fallback_scorer import TrueFalseFallbackScorer
     from pyrit.score.true_false.true_false_inverter_scorer import TrueFalseInverterScorer
     from pyrit.score.true_false.true_false_score_aggregator import TrueFalseAggregatorFunc, TrueFalseScoreAggregator
     from pyrit.score.true_false.true_false_scorer import MessageTrueFalseScorer, TrueFalseScorer
@@ -274,6 +275,7 @@ _LAZY_EXPORTS: dict[str, str | tuple[str, str | None]] = {
     "SubStringScorer": "pyrit.score.true_false.substring_scorer",
     "SystemPromptExtractionScorer": "pyrit.score.float_scale.system_prompt_extraction_scorer",
     "TrueFalseCompositeScorer": "pyrit.score.true_false.true_false_composite_scorer",
+    "TrueFalseFallbackScorer": "pyrit.score.true_false.true_false_fallback_scorer",
     "TrueFalseInverterScorer": "pyrit.score.true_false.true_false_inverter_scorer",
     "TrueFalseQuestion": "pyrit.score.true_false.self_ask_true_false_scorer",
     "TrueFalseQuestionPaths": "pyrit.score.true_false.self_ask_true_false_scorer",
