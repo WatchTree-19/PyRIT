@@ -19,12 +19,12 @@ from pyrit.score import LocalRefusalClassifierScorer
 from pyrit.score.true_false import local_refusal_classifier_scorer as module
 from pyrit.score.true_false.local_refusal_classifier_scorer import (
     _ChunkPrediction,
-    _format_response,
     _LayaEncoder,
     _load_training_rows,
     _predict_probability,
     _train_head,
     _TrainedHead,
+    _TrainingFeatures,
 )
 
 pytestmark = pytest.mark.usefixtures("patch_central_database")
@@ -50,21 +50,17 @@ def _scorer(
     return scorer
 
 
-def test_legacy_training_format_and_pins() -> None:
-    assert _format_response("abc") == "abc"
-    assert _format_response("x" * 900) == "x" * 400
-    state = module._build_state(objective="x" * 2000, response="no")
-    assert list(state) == ["response", "objective"]
-    assert state["objective"] == "x" * 1000
+def test_training_dataset_pins() -> None:
     pairs, labels = _load_training_rows()
     assert len(pairs) == len(labels) == 169
     assert set(labels) == {0, 1}
-    assert all(len(response) <= 400 for _, response in pairs)
     assert LocalRefusalClassifierScorer.compute_dataset_hashes() == module._TRAINING_DATASETS
 
 
 def test_training_rejects_changed_data(tmp_path: Path) -> None:
-    data = b"objective,assistant_response,human_score,data_type\ncontext,no,1,text\n"
+    objective = "context " * 2000
+    response = "response " * 1000
+    data = f"objective,assistant_response,human_score,data_type\n{objective},{response},1,text\n".encode()
     for name in module._TRAINING_DATASETS:
         (tmp_path / name).write_bytes(data)
     with patch.object(module, "_REFUSAL_EVALS_PATH", tmp_path):
@@ -72,7 +68,7 @@ def test_training_rejects_changed_data(tmp_path: Path) -> None:
             _load_training_rows()
         pins = dict.fromkeys(module._TRAINING_DATASETS, hashlib.sha256(data).hexdigest())
         with patch.object(module, "_TRAINING_DATASETS", pins):
-            assert _load_training_rows() == ([("context", "no")] * 2, [1, 1])
+            assert _load_training_rows() == ([(objective, response)] * 2, [1, 1])
 
 
 @requires_torch
@@ -205,17 +201,34 @@ async def test_transport_error_stays_undetermined_async() -> None:
 
 
 async def test_training_once_async() -> None:
-    scorer = LocalRefusalClassifierScorer()
+    scorer = LocalRefusalClassifierScorer(max_input_tokens=400, chunk_overlap_tokens=32, max_objective_tokens=64)
     scorer._encoder = MagicMock(spec=_LayaEncoder)
-    scorer._encoder.features_async = AsyncMock(return_value=[[1.0]])
+    training = _TrainingFeatures(features=[[1.0], [-1.0]], labels=[1, 0])
+    scorer._encoder.training_features_async = AsyncMock(return_value=training)
     with (
-        patch.object(module, "_load_training_rows", return_value=([("o", "r")], [1])),
+        patch.object(module, "_load_training_rows", return_value=([("o", "r"), ("o", "long"), ("o", "no")], [1, 1, 0])),
         patch.object(module, "_train_head", return_value=_head()) as train,
     ):
         await scorer.load_model_async()
         await scorer.load_model_async()
     train.assert_called_once()
-    scorer._encoder.features_async.assert_awaited_once()
+    scorer._encoder.training_features_async.assert_awaited_once()
+    args = scorer._encoder.training_features_async.await_args.kwargs
+    assert args["max_input_tokens"] == 400
+    assert args["chunk_overlap_tokens"] == 32
+    assert args["max_objective_tokens"] == 64
+    assert args["labels"] == [1, 1, 0]
+    assert train.call_args.kwargs == {"features": training.features, "labels": training.labels}
+
+
+@requires_torch
+@pytest.mark.parametrize(
+    ("features", "labels"),
+    [([], []), ([[1.0]], [1]), ([[1.0], [2.0]], [1, 1]), ([[1.0], [2.0]], [0, 0]), ([[1.0]], [0, 1])],
+)
+def test_training_rejects_insufficient_retained_data(features: list[list[float]], labels: list[int]) -> None:
+    with pytest.raises(ValueError, match="at least two complete single-window responses with both labels"):
+        _train_head(features=features, labels=labels)
 
 
 async def test_default_evaluation_requires_mapping_async() -> None:
@@ -253,6 +266,9 @@ def test_recipe_is_retained_and_hashed() -> None:
     digest = hashlib.sha256(json.dumps(recipe, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
     assert baseline.params["recipe_digest"] == digest
     assert recipe["datasets"] == module._TRAINING_DATASETS
+    assert recipe["version"] == 4
+    assert "single-window" in recipe["training_selection"]
+    assert "training_response_chars" not in recipe
     assert baseline == LocalRefusalClassifierScorer().get_identifier()
     with patch.object(module, "_WEIGHT_DECAY", 20.0):
         assert baseline.eval_hash != LocalRefusalClassifierScorer().get_identifier().eval_hash
@@ -392,6 +408,65 @@ def test_real_tokenizer_window_coverage(
     assert restored == tokenizer.encode(sanitized, add_special_tokens=False)
     assert tokenizer.mask_token_id not in restored
     assert tokenizer.convert_tokens_to_ids("tail") in chunks[-1]
+    with (
+        patch.object(encoder, "_features_from_sequences", return_value=[1.0]) as features,
+        patch.object(module, "_predict_probability", return_value=0.9),
+    ):
+        training = encoder._training_features(
+            texts=[(objective, response)],
+            labels=[1],
+            max_input_tokens=512,
+            chunk_overlap_tokens=64,
+            max_objective_tokens=128,
+        )
+        if long_response:
+            assert training == _TrainingFeatures(features=[], labels=[])
+            features.assert_not_called()
+        else:
+            assert training == _TrainingFeatures(features=[[1.0]], labels=[1])
+            training_sequences = features.call_args.args[0]
+            features.reset_mock()
+            encoder._predict_response(
+                head=_head(),
+                objective=objective,
+                response=response,
+                max_input_tokens=512,
+                chunk_overlap_tokens=64,
+                max_objective_tokens=128,
+            )
+            features.assert_called_once_with(training_sequences)
+
+
+async def test_training_excludes_whole_multiwindow_rows_async(
+    encoder: _LayaEncoder, common: MagicMock, caplog: pytest.LogCaptureFixture
+) -> None:
+    settings = {"max_input_tokens": 96, "chunk_overlap_tokens": 8, "max_objective_tokens": 12}
+    empty_windows, _ = encoder._response_windows(objective="", response="", **settings)
+    budget = 96 - len(next(empty_windows)[0][0])
+    exact_fit = "x" * budget
+    texts = [("", "short"), ("", exact_fit + "x"), ("", exact_fit)]
+    with patch.object(encoder, "_features_from_sequences", side_effect=[[1.0], [2.0]]) as features:
+        training = await encoder.training_features_async(texts=texts, labels=[0, 0, 1], **settings)
+    assert training.features == [[1.0], [2.0]]
+    assert training.labels == [0, 1]
+    assert features.call_count == 2
+    assert "excluded 1 of 3 training rows" in caplog.text
+    assert "2 complete responses remain" in caplog.text
+    windows, _ = encoder._response_windows(objective="", response=exact_fit, **settings)
+    assert features.call_args.args[0] == next(windows)
+
+
+@requires_torch
+async def test_training_failure_does_not_set_head_async() -> None:
+    scorer = LocalRefusalClassifierScorer()
+    with (
+        patch.object(module, "_load_training_rows", return_value=([("", "long")], [1])),
+        patch.object(scorer._encoder, "training_features_async", new_callable=AsyncMock) as features,
+    ):
+        features.return_value = _TrainingFeatures(features=[], labels=[])
+        with pytest.raises(ValueError, match="both labels"):
+            await scorer.load_model_async()
+        assert scorer._head is None
 
 
 def test_missing_markers_raise(encoder: _LayaEncoder, common: MagicMock) -> None:
@@ -462,9 +537,8 @@ async def test_predict_response_async_delegates_async(encoder: _LayaEncoder) -> 
     assert predict.call_args.kwargs["response"] == "full response"
 
 
-async def test_encoder_loads_once_and_skips_empty_features_async() -> None:
+async def test_encoder_loads_once_async() -> None:
     encoder = _LayaEncoder()
-    assert await encoder.features_async(texts=[]) == []
     with patch.object(encoder, "_load_model", return_value=object()) as load:
         await encoder.load_model_async()
         await encoder.load_model_async()
@@ -500,7 +574,7 @@ def test_missing_package_error() -> None:
 
 
 @requires_torch
-async def test_features_restore_option_order_and_average_async(common: MagicMock) -> None:
+def test_features_restore_option_order_and_average(common: MagicMock) -> None:
     import torch
 
     common.QTYPES = {"choice": 0}
@@ -518,4 +592,4 @@ async def test_features_restore_option_order_and_average_async(common: MagicMock
     model.head.layers = []
     encoder = _LayaEncoder()
     encoder._agent = SimpleNamespace(model=model, tok=SimpleNamespace(pad_token_id=0), device="cpu", cfg={})
-    assert await encoder.features_async(texts=[("objective", "response")]) == [[2.0, 3.0, 2.0, 3.0]]
+    assert encoder._features_from_sequences([([1, 2, 3, 4], [1, 2])] * 2) == [2.0, 3.0, 2.0, 3.0]

@@ -374,9 +374,13 @@ print(f"[category] value={scored.get_value()} category={scored.score_category}")
 # Fully blocked responses and SDK-provided structured refusals return `True` without model inference;
 # readable partial output is scored normally.
 #
-# Training retains the legacy 400-character response and 1,000-character objective cutoffs.
-# Earlier cross-dataset accuracy figures do not validate this new inference policy or the shipped
-# model trained on both datasets. No-objective and non-English use are also unvalidated. There is
+# Training uses the same tokenization, framing, and token budgets as inference, without character
+# cutoffs. It selects complete responses that fit one window from both packaged refusal datasets.
+# Whole-response labels are not assigned to individual chunks: multi-window training rows are
+# excluded, and their count is logged. Fitting fails if fewer than two examples or either label
+# class remains. Token settings therefore affect both the training subset and the fitted head.
+# Earlier cross-dataset accuracy figures do not validate this recipe or long-response inference.
+# No-objective and non-English use are also unvalidated. There is
 # no default evaluation mapping or automatic best-scorer registration. Choose this scorer explicitly
 # and evaluate on independent data before relying on its verdicts.
 #
