@@ -256,8 +256,10 @@ print(f"Saved attack tool evidence: {replayed.get_value()}")
 # `LiteLLMChatTarget` accepts the same `trace_config` and also disables tracing by
 # default. When enabled, each request sends a fresh `traceparent` through LiteLLM's
 # `extra_headers`, and PyRIT saves the same context on the request. Enable it only
-# when the provider or gateway accepts W3C trace context. A model-call span is not
-# tool evidence; the scorer still needs execution spans for the named tool.
+# when the provider or gateway accepts W3C trace context. While it is enabled, manual
+# trace headers in `headers`, `extra_headers` or `provider_specific_header` are
+# rejected. A model-call span is not tool evidence; the scorer still needs execution
+# spans for the named tool.
 
 # %% [markdown]
 # ## Use another trace source

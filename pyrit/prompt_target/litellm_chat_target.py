@@ -4,7 +4,7 @@
 import itertools
 import logging
 import os
-from collections.abc import Awaitable, Callable, MutableSequence, Sequence
+from collections.abc import Awaitable, Callable, Mapping, MutableSequence, Sequence
 from typing import Any, NoReturn, cast
 
 from pyrit.auth import ensure_async_token_provider
@@ -104,6 +104,33 @@ def _build_output_modalities(*, audio: bool) -> frozenset[frozenset[PromptDataTy
         output.append(cast("frozenset[PromptDataType]", frozenset({"audio_path"})))
         output.append(cast("frozenset[PromptDataType]", frozenset({"text", "audio_path"})))
     return frozenset(output)
+
+
+def _provider_specific_headers(provider_specific_header: Any) -> dict[str, str]:
+    """
+    Collect the headers from every ``provider_specific_header`` entry.
+
+    LiteLLM accepts one entry or a sequence of entries and merges the ``extra_headers`` of each
+    entry scoped to the resolved provider. Every entry is collected so a conflict check does
+    not depend on provider resolution.
+
+    Args:
+        provider_specific_header (Any): The ``provider_specific_header`` request value.
+
+    Returns:
+        dict[str, str]: The headers of all entries.
+    """
+    if isinstance(provider_specific_header, Mapping):
+        entries: Sequence[Any] = (provider_specific_header,)
+    elif isinstance(provider_specific_header, Sequence):
+        entries = provider_specific_header
+    else:
+        return {}
+    headers: dict[str, str] = {}
+    for entry in entries:
+        if isinstance(entry, Mapping):
+            headers.update(entry.get("extra_headers") or {})
+    return headers
 
 
 class LiteLLMChatTarget(PromptTarget):
@@ -390,9 +417,15 @@ class LiteLLMChatTarget(PromptTarget):
         api_key = await self._resolve_api_key_async()
         body = self._construct_request_body(messages=messages, json_config=json_config, api_key=api_key)
         # Applied after the passthrough merge so ``extra_body_parameters`` cannot drop the context.
-        # LiteLLM merges ``headers`` with ``extra_headers``, so both are checked for manual values.
+        # LiteLLM merges ``headers`` with ``extra_headers`` and then the provider-specific headers,
+        # so all three are checked for manual values.
         trace_headers = request_trace_headers(
-            request=message, headers=body.get("extra_headers") or {}, default_headers=body.get("headers")
+            request=message,
+            headers=body.get("extra_headers") or {},
+            default_headers={
+                **(body.get("headers") or {}),
+                **_provider_specific_headers(body.get("provider_specific_header")),
+            },
         )
         if trace_headers:
             body["extra_headers"] = trace_headers
