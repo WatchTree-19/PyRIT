@@ -109,7 +109,6 @@ from pyrit.models import (
     sort_message_pieces,
 )
 from pyrit.models.results.attack_result import ATTRIBUTION_FIELDS, ATTRIBUTION_VALUE_MAX_LENGTH
-from pyrit.models.results.attack_result_scope import get_current_attack_result_id
 
 if TYPE_CHECKING:
     from sqlalchemy.sql.elements import ColumnElement
@@ -888,9 +887,8 @@ class MemoryInterface(abc.ABC):
         ``conversation_id`` with a different target is a conflict and raises ``ValueError`` -- a conversation is held
         with exactly one target and is never re-targeted.
 
-        A conversation registered during an attack execution is linked to that execution's
-        result ID unless ``conversation.attack_result_id`` is set. Registering a conversation
-        that belongs to a different execution raises ``ValueError``.
+        The caller supplies ownership through ``conversation.attack_result_id``.
+        Registering a conversation that belongs to a different execution raises ``ValueError``.
 
         Args:
             conversation (Conversation): The conversation metadata to record, carrying the
@@ -1031,10 +1029,8 @@ class MemoryInterface(abc.ABC):
         """
         Register conversation metadata in the caller's transaction, without committing.
 
-        A conversation registered during an attack execution belongs to that execution:
-        unless ``conversation.attack_result_id`` is set explicitly, the current execution's
-        result ID is recorded. An existing conversation with no owner is claimed; one owned
-        by a different execution is never reassigned.
+        The caller supplies the owner explicitly. An existing conversation with no owner
+        can be claimed; one owned by a different execution is never reassigned.
 
         Raises:
             ValueError: If the ID is empty, or the conversation is already held with a different
@@ -1042,8 +1038,6 @@ class MemoryInterface(abc.ABC):
         """
         if not conversation.conversation_id:
             raise ValueError("Cannot register a conversation without a conversation_id.")
-        if conversation.attack_result_id is None:
-            conversation = conversation.model_copy(update={"attack_result_id": get_current_attack_result_id()})
         entry = ConversationEntry(conversation=conversation)
         existing = session.get(ConversationEntry, conversation.conversation_id)
         if existing is None:
@@ -1066,13 +1060,22 @@ class MemoryInterface(abc.ABC):
             )
         if entry.attack_result_id is None or existing.attack_result_id == entry.attack_result_id:
             return
-        if existing.attack_result_id is not None:
+        session.execute(
+            update(ConversationEntry)
+            .where(
+                ConversationEntry.conversation_id == conversation.conversation_id,
+                ConversationEntry.attack_result_id.is_(None),
+            )
+            .values(attack_result_id=entry.attack_result_id)
+            .execution_options(synchronize_session=False)
+        )
+        session.refresh(existing)
+        if existing.attack_result_id != entry.attack_result_id:
             raise ValueError(
                 f"Conversation {conversation.conversation_id} belongs to attack result "
                 f"{existing.attack_result_id} and cannot be assigned to attack result {entry.attack_result_id}. "
                 "An attack execution that reuses existing history must copy it into a new conversation."
             )
-        existing.attack_result_id = entry.attack_result_id
 
     def _execute_add_conversation_retry(
         self, *, conversation_id: str, sequence: int, reason: ConversationRetryReason
@@ -1098,11 +1101,7 @@ class MemoryInterface(abc.ABC):
             try:
                 entry = session.get(ConversationEntry, str(conversation_id))
                 if entry is None:
-                    entry = ConversationEntry(
-                        conversation=Conversation(
-                            conversation_id=str(conversation_id), attack_result_id=get_current_attack_result_id()
-                        )
-                    )
+                    entry = ConversationEntry(conversation=Conversation(conversation_id=str(conversation_id)))
                     session.add(entry)
                 entry.retries = [*(entry.retries or []), record]
                 flag_modified(entry, "retries")
@@ -3101,7 +3100,7 @@ class MemoryInterface(abc.ABC):
 
         return new_conversation_id, all_pieces
 
-    def _execute_duplicate_conversation(self, *, conversation_id: str) -> str:
+    def _execute_duplicate_conversation(self, *, conversation_id: str, attack_result_id: str | None = None) -> str:
         """
         Duplicate a conversation for reuse.
 
@@ -3111,6 +3110,7 @@ class MemoryInterface(abc.ABC):
 
         Args:
             conversation_id (str): The conversation ID with existing conversations.
+            attack_result_id (str | None): Destination owner. Defaults to the source owner.
 
         Returns:
             The uuid for the new conversation.
@@ -3120,6 +3120,8 @@ class MemoryInterface(abc.ABC):
         )
         source_metadata = self._get_conversation(conversation_id=conversation_id)
         source_target = source_metadata.target_identifier if source_metadata else None
+        if attack_result_id is None and source_metadata is not None:
+            attack_result_id = source_metadata.attack_result_id
         new_conversation_id, all_pieces = self._dispatch_memory_operation(
             "duplicate_messages", self._execute_duplicate_messages, messages=messages
         )
@@ -3127,14 +3129,20 @@ class MemoryInterface(abc.ABC):
             self._dispatch_memory_operation(
                 "add_conversation_to_memory",
                 self._execute_add_conversation_to_memory,
-                conversation=Conversation(conversation_id=new_conversation_id, target_identifier=source_target),
+                conversation=Conversation(
+                    conversation_id=new_conversation_id,
+                    target_identifier=source_target,
+                    attack_result_id=attack_result_id,
+                ),
             )
             self._dispatch_memory_operation(
                 "add_message_pieces_to_memory", self._execute_add_message_pieces_to_memory, message_pieces=all_pieces
             )
         return new_conversation_id
 
-    def _execute_duplicate_conversation_excluding_last_turn(self, *, conversation_id: str) -> str:
+    def _execute_duplicate_conversation_excluding_last_turn(
+        self, *, conversation_id: str, attack_result_id: str | None = None
+    ) -> str:
         """
         Duplicate a conversation, excluding the last turn. In this case, last turn is defined as before the last
         user request (e.g. if there is half a turn, it just removes that half).
@@ -3143,6 +3151,7 @@ class MemoryInterface(abc.ABC):
 
         Args:
             conversation_id (str): The conversation ID with existing conversations.
+            attack_result_id (str | None): Destination owner. Defaults to the source owner.
 
         Returns:
             The uuid for the new conversation.
@@ -3167,6 +3176,8 @@ class MemoryInterface(abc.ABC):
 
         source_metadata = self._get_conversation(conversation_id=conversation_id)
         source_target = source_metadata.target_identifier if source_metadata else None
+        if attack_result_id is None and source_metadata is not None:
+            attack_result_id = source_metadata.attack_result_id
         new_conversation_id, all_pieces = self._dispatch_memory_operation(
             "duplicate_messages", self._execute_duplicate_messages, messages=messages_to_duplicate
         )
@@ -3174,7 +3185,11 @@ class MemoryInterface(abc.ABC):
             self._dispatch_memory_operation(
                 "add_conversation_to_memory",
                 self._execute_add_conversation_to_memory,
-                conversation=Conversation(conversation_id=new_conversation_id, target_identifier=source_target),
+                conversation=Conversation(
+                    conversation_id=new_conversation_id,
+                    target_identifier=source_target,
+                    attack_result_id=attack_result_id,
+                ),
             )
             self._dispatch_memory_operation(
                 "add_message_pieces_to_memory", self._execute_add_message_pieces_to_memory, message_pieces=all_pieces
@@ -4573,6 +4588,9 @@ class MemoryInterface(abc.ABC):
             raise ValueError("A prepared branch cannot replace the source conversation")
         if any(not piece.not_in_memory and piece.conversation_id not in conversation_ids for piece in message_pieces):
             raise ValueError("Copied message pieces must belong to the prepared branches")
+        for conversation in [*conversations, *([source_conversation] if source_conversation else [])]:
+            if conversation.attack_result_id not in (None, attack_result_id):
+                raise ValueError("Prepared conversations must belong to the destination attack")
 
         with closing(self._get_session()) as session, session.begin():
             entry = self._get_locked_attack_result(session=session, attack_result_id=attack_result_id)
@@ -4582,9 +4600,15 @@ class MemoryInterface(abc.ABC):
                 active_ids = {entry.conversation_id, *(entry.pruned_conversation_ids or [])}
                 if source_conversation.conversation_id not in active_ids:
                     raise ValueError("Source conversation is not an active objective conversation of this attack")
-                self._insert_conversation_in_session(session=session, conversation=source_conversation)
+                self._insert_conversation_in_session(
+                    session=session,
+                    conversation=source_conversation.model_copy(update={"attack_result_id": attack_result_id}),
+                )
             for conversation in conversations:
-                self._insert_conversation_in_session(session=session, conversation=conversation)
+                self._insert_conversation_in_session(
+                    session=session,
+                    conversation=conversation.model_copy(update={"attack_result_id": attack_result_id}),
+                )
             self._add_message_pieces_to_session(session=session, message_pieces=message_pieces)
             pruned_ids = list(entry.pruned_conversation_ids or [])
             for conversation_id in conversation_ids:
@@ -6331,9 +6355,8 @@ class MemoryInterface(abc.ABC):
         ``conversation_id`` with a different target is a conflict and raises ``ValueError`` -- a conversation is held
         with exactly one target and is never re-targeted.
 
-        A conversation registered during an attack execution is linked to that execution's
-        result ID unless ``conversation.attack_result_id`` is set. Registering a conversation
-        that belongs to a different execution raises ``ValueError``.
+        The caller supplies ownership through ``conversation.attack_result_id``.
+        Registering a conversation that belongs to a different execution raises ``ValueError``.
 
         Args:
             conversation (Conversation): The conversation metadata to record, carrying the
@@ -7592,7 +7615,7 @@ class MemoryInterface(abc.ABC):
         """
         return await self._run_database_operation_async(self._execute_duplicate_messages, messages=messages)
 
-    def duplicate_conversation(self, *, conversation_id: str) -> str:
+    def duplicate_conversation(self, *, conversation_id: str, attack_result_id: str | None = None) -> str:
         """
         Use ``duplicate_conversation_async``.
 
@@ -7606,10 +7629,10 @@ class MemoryInterface(abc.ABC):
             new_item="MemoryInterface.duplicate_conversation_async",
             removed_in="1.4.0",
         )
-        return self._execute_duplicate_conversation(conversation_id=conversation_id)
+        return self._execute_duplicate_conversation(conversation_id=conversation_id, attack_result_id=attack_result_id)
 
     @legacy_sync_override(lambda: MemoryInterface.duplicate_conversation)
-    async def duplicate_conversation_async(self, *, conversation_id: str) -> str:
+    async def duplicate_conversation_async(self, *, conversation_id: str, attack_result_id: str | None = None) -> str:
         """
         Duplicate a conversation for reuse.
 
@@ -7619,15 +7642,18 @@ class MemoryInterface(abc.ABC):
 
         Args:
             conversation_id (str): The conversation ID with existing conversations.
+            attack_result_id (str | None): Destination owner. Defaults to the source owner.
 
         Returns:
             The uuid for the new conversation.
         """
         return await self._run_database_operation_async(
-            self._execute_duplicate_conversation, conversation_id=conversation_id
+            self._execute_duplicate_conversation, conversation_id=conversation_id, attack_result_id=attack_result_id
         )
 
-    def duplicate_conversation_excluding_last_turn(self, *, conversation_id: str) -> str:
+    def duplicate_conversation_excluding_last_turn(
+        self, *, conversation_id: str, attack_result_id: str | None = None
+    ) -> str:
         """
         Use ``duplicate_conversation_excluding_last_turn_async``.
 
@@ -7641,10 +7667,14 @@ class MemoryInterface(abc.ABC):
             new_item="MemoryInterface.duplicate_conversation_excluding_last_turn_async",
             removed_in="1.4.0",
         )
-        return self._execute_duplicate_conversation_excluding_last_turn(conversation_id=conversation_id)
+        return self._execute_duplicate_conversation_excluding_last_turn(
+            conversation_id=conversation_id, attack_result_id=attack_result_id
+        )
 
     @legacy_sync_override(lambda: MemoryInterface.duplicate_conversation_excluding_last_turn)
-    async def duplicate_conversation_excluding_last_turn_async(self, *, conversation_id: str) -> str:
+    async def duplicate_conversation_excluding_last_turn_async(
+        self, *, conversation_id: str, attack_result_id: str | None = None
+    ) -> str:
         """
         Duplicate a conversation, excluding the last turn. In this case, last turn is defined as before the last
         user request (e.g. if there is half a turn, it just removes that half).
@@ -7653,12 +7683,15 @@ class MemoryInterface(abc.ABC):
 
         Args:
             conversation_id (str): The conversation ID with existing conversations.
+            attack_result_id (str | None): Destination owner. Defaults to the source owner.
 
         Returns:
             The uuid for the new conversation.
         """
         return await self._run_database_operation_async(
-            self._execute_duplicate_conversation_excluding_last_turn, conversation_id=conversation_id
+            self._execute_duplicate_conversation_excluding_last_turn,
+            conversation_id=conversation_id,
+            attack_result_id=attack_result_id,
         )
 
     def add_message_to_memory(self, *, request: Message) -> None:

@@ -20,8 +20,8 @@ def get_current_attack_result_id() -> str | None:
     Return the ID of the attack result the current attack execution produces.
 
     The ID is allocated when execution starts, so targets, scorers, converters and
-    harnesses can read it before they send anything. Conversations created during the
-    execution are linked to it through ``Conversation.attack_result_id``.
+    harnesses can read it before they send anything. Conversation creators pass it
+    explicitly to ``Conversation.attack_result_id`` when registering ownership.
 
     Returns:
         str | None: The ID, or None outside an attack execution.

@@ -45,8 +45,7 @@ class Conversation(BaseModel):
     conversation_id: str
     target_identifier: ComponentIdentifierField | None = None
 
-    # ID of the attack result whose execution owns this conversation. Memory records it
-    # when the conversation is registered during an execution; None outside one.
+    # ID of the owning execution's result, supplied by the conversation creator.
     attack_result_id: str | None = None
 
     # Turns that were retried (rolled back out of memory and resent) in this conversation.

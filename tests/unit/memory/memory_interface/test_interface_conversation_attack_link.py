@@ -5,10 +5,10 @@ import uuid
 
 import pytest
 
+from pyrit.common.attack_result_scope import attack_result_id_scope, get_current_attack_result_id
 from pyrit.memory import MemoryInterface
 from pyrit.memory.memory_models import ConversationEntry
 from pyrit.models import Conversation, ConversationRetryReason, Message, MessagePiece
-from pyrit.models.results.attack_result_scope import attack_result_id_scope, get_current_attack_result_id
 
 ATTACK_A = str(uuid.uuid4())
 ATTACK_B = str(uuid.uuid4())
@@ -49,15 +49,15 @@ async def test_conversation_registered_outside_an_execution_has_no_owner(sqlite_
     assert await _owner_async(sqlite_instance, "conv-free") is None
 
 
-async def test_conversation_registered_during_an_execution_is_linked(sqlite_instance: MemoryInterface) -> None:
+async def test_memory_does_not_infer_ownership_from_execution(sqlite_instance: MemoryInterface) -> None:
     with attack_result_id_scope(attack_result_id=ATTACK_A):
         await _register_async(sqlite_instance, "conv-a")
 
-    assert await _owner_async(sqlite_instance, "conv-a") == ATTACK_A
+    assert await _owner_async(sqlite_instance, "conv-a") is None
     [entry] = sqlite_instance._query_entries(
         ConversationEntry, conditions=ConversationEntry.conversation_id == "conv-a"
     )
-    assert entry.attack_result_id == uuid.UUID(ATTACK_A)
+    assert entry.attack_result_id is None
 
 
 async def test_explicit_owner_is_recorded(sqlite_instance: MemoryInterface) -> None:
@@ -68,20 +68,16 @@ async def test_explicit_owner_is_recorded(sqlite_instance: MemoryInterface) -> N
 
 
 async def test_registering_again_for_the_same_execution_is_a_no_op(sqlite_instance: MemoryInterface) -> None:
-    with attack_result_id_scope(attack_result_id=ATTACK_A):
-        await _register_async(sqlite_instance, "conv-same")
-        await _register_async(sqlite_instance, "conv-same")
+    await _register_async(sqlite_instance, "conv-same", attack_result_id=ATTACK_A)
+    await _register_async(sqlite_instance, "conv-same", attack_result_id=ATTACK_A)
     await _register_async(sqlite_instance, "conv-same")
 
     assert await _owner_async(sqlite_instance, "conv-same") == ATTACK_A
 
 
 async def test_conversation_cannot_be_assigned_to_a_different_execution(sqlite_instance: MemoryInterface) -> None:
-    with attack_result_id_scope(attack_result_id=ATTACK_A):
-        await _register_async(sqlite_instance, "conv-owned")
+    await _register_async(sqlite_instance, "conv-owned", attack_result_id=ATTACK_A)
 
-    with attack_result_id_scope(attack_result_id=ATTACK_B), pytest.raises(ValueError, match="belongs to attack result"):
-        await _register_async(sqlite_instance, "conv-owned")
     with pytest.raises(ValueError, match="cannot be assigned to attack result"):
         await _register_async(sqlite_instance, "conv-owned", attack_result_id=ATTACK_B)
 
@@ -91,15 +87,14 @@ async def test_conversation_cannot_be_assigned_to_a_different_execution(sqlite_i
 async def test_unowned_conversation_is_claimed_by_the_first_execution(sqlite_instance: MemoryInterface) -> None:
     await _register_async(sqlite_instance, "conv-unowned")
 
-    with attack_result_id_scope(attack_result_id=ATTACK_A):
-        await _register_async(sqlite_instance, "conv-unowned")
+    await _register_async(sqlite_instance, "conv-unowned", attack_result_id=ATTACK_A)
 
     assert await _owner_async(sqlite_instance, "conv-unowned") == ATTACK_A
 
 
-async def test_copies_take_the_current_execution_as_owner(sqlite_instance: MemoryInterface) -> None:
+async def test_copies_preserve_or_explicitly_replace_the_owner(sqlite_instance: MemoryInterface) -> None:
     with attack_result_id_scope(attack_result_id=ATTACK_A):
-        await _register_async(sqlite_instance, "conv-source")
+        await _register_async(sqlite_instance, "conv-source", attack_result_id=ATTACK_A)
         await _add_turn_async(sqlite_instance, "conv-source")
         await _add_turn_async(sqlite_instance, "conv-source")
         same_execution_copy = await sqlite_instance.duplicate_conversation_async(conversation_id="conv-source")
@@ -107,17 +102,20 @@ async def test_copies_take_the_current_execution_as_owner(sqlite_instance: Memor
             conversation_id="conv-source"
         )
     with attack_result_id_scope(attack_result_id=ATTACK_B):
-        new_execution_copy = await sqlite_instance.duplicate_conversation_async(conversation_id="conv-source")
+        new_execution_copy = await sqlite_instance.duplicate_conversation_async(
+            conversation_id="conv-source", attack_result_id=ATTACK_B
+        )
     unscoped_copy = await sqlite_instance.duplicate_conversation_async(conversation_id="conv-source")
 
     assert await _owner_async(sqlite_instance, same_execution_copy) == ATTACK_A
     assert await _owner_async(sqlite_instance, same_execution_trimmed) == ATTACK_A
     assert await _owner_async(sqlite_instance, new_execution_copy) == ATTACK_B
-    assert await _owner_async(sqlite_instance, unscoped_copy) is None
+    assert await _owner_async(sqlite_instance, unscoped_copy) == ATTACK_A
     assert await _owner_async(sqlite_instance, "conv-source") == ATTACK_A
 
 
 async def test_retry_record_created_during_an_execution_is_linked(sqlite_instance: MemoryInterface) -> None:
+    await _register_async(sqlite_instance, "conv-retry", attack_result_id=ATTACK_A)
     with attack_result_id_scope(attack_result_id=ATTACK_A):
         await sqlite_instance.add_conversation_retry_async(
             conversation_id="conv-retry", sequence=1, reason=ConversationRetryReason.JSON_PARSING
@@ -127,11 +125,9 @@ async def test_retry_record_created_during_an_execution_is_linked(sqlite_instanc
 
 
 async def test_conversations_and_pieces_are_queryable_by_result_id(sqlite_instance: MemoryInterface) -> None:
-    with attack_result_id_scope(attack_result_id=ATTACK_A):
-        await _register_async(sqlite_instance, "conv-a-2")
-        await _register_async(sqlite_instance, "conv-a-1")
-    with attack_result_id_scope(attack_result_id=ATTACK_B):
-        await _register_async(sqlite_instance, "conv-b")
+    await _register_async(sqlite_instance, "conv-a-2", attack_result_id=ATTACK_A)
+    await _register_async(sqlite_instance, "conv-a-1", attack_result_id=ATTACK_A)
+    await _register_async(sqlite_instance, "conv-b", attack_result_id=ATTACK_B)
     for conversation_id in ("conv-a-1", "conv-a-2", "conv-b"):
         await _add_turn_async(sqlite_instance, conversation_id)
 

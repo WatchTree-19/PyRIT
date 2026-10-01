@@ -130,7 +130,6 @@ if TYPE_CHECKING:
     )
     from pyrit.models.question_answering import QuestionAnsweringDataset, QuestionAnsweringEntry, QuestionChoice
     from pyrit.models.results.attack_result import AttackOutcome, AttackResult, AttackResultT
-    from pyrit.models.results.attack_result_scope import get_current_attack_result_id
     from pyrit.models.results.scenario_result import ScenarioResult, ScenarioRunState
     from pyrit.models.results.strategy_result import StrategyResult, StrategyResultT
     from pyrit.models.retry_event import RetryEvent
@@ -265,7 +264,6 @@ _LAZY_EXPORTS: dict[str, str] = {
     "AttackResult": "pyrit.models.results.attack_result",
     "AttackResultT": "pyrit.models.results.attack_result",
     "AttackOutcome": "pyrit.models.results.attack_result",
-    "get_current_attack_result_id": "pyrit.models.results.attack_result_scope",
     "ChatMessage": "pyrit.models.messages.chat_message",
     "ChatMessagesDataset": "pyrit.models.messages.chat_message",
     "ChatMessageRole": "pyrit.models.literals",

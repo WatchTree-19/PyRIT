@@ -14,6 +14,7 @@ from dataclasses import dataclass, field
 from enum import Enum
 from typing import TYPE_CHECKING, Any, ClassVar, Generic, TypeVar, overload
 
+from pyrit.common.attack_result_scope import attack_result_id_scope
 from pyrit.common.logger import logger
 from pyrit.exceptions.retry_collector import (
     get_retry_collector,
@@ -44,7 +45,6 @@ from pyrit.models import (
     TargetIdentifier,
     UndeterminedScoreError,
 )
-from pyrit.models.results.attack_result_scope import attack_result_id_scope
 from pyrit.prompt_target.common.target_requirements import TargetRequirements
 
 if TYPE_CHECKING:

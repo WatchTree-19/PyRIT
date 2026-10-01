@@ -8,6 +8,7 @@ from typing import Any
 import pytest
 from unit.mocks import MockPromptTarget
 
+from pyrit.common.attack_result_scope import get_current_attack_result_id
 from pyrit.converter import SuffixAppendConverter
 from pyrit.converter.converter import ConverterResult
 from pyrit.executor.attack import (
@@ -29,7 +30,6 @@ from pyrit.models import (
     MessagePiece,
     PromptDataType,
     SeedObjective,
-    get_current_attack_result_id,
 )
 from pyrit.prompt_normalizer import ConverterConfiguration
 from pyrit.score import SelfAskRefusalScorer, SubStringScorer
