@@ -8,8 +8,9 @@ import os
 import tempfile
 import traceback
 import wave
-from collections.abc import Callable, Mapping
-from contextlib import AbstractAsyncContextManager, nullcontext
+from collections.abc import Callable, Iterator, Mapping
+from contextlib import AbstractAsyncContextManager, contextmanager, nullcontext
+from contextvars import ContextVar
 from pathlib import Path
 from typing import Any
 from uuid import uuid4
@@ -37,6 +38,26 @@ from pyrit.prompt_target.batch_helper import batch_task_async
 from pyrit.prompt_target.common.target_send_context import TargetSendContext
 
 logger = logging.getLogger(__name__)
+
+_current_attack_result_id: ContextVar[str | None] = ContextVar("pyrit_attack_result_id", default=None)
+
+
+@contextmanager
+def attack_result_id_scope(*, attack_result_id: str) -> Iterator[None]:
+    """
+    Record an attack result ID on every request persisted within this scope.
+
+    An attack opens the scope for one execution, so requests in each of its
+    conversations name the result they contribute to.
+
+    Args:
+        attack_result_id (str): The ID allocated for the attack result.
+    """
+    token = _current_attack_result_id.set(attack_result_id)
+    try:
+        yield
+    finally:
+        _current_attack_result_id.reset(token)
 
 
 def _is_write_only_response(responses: object) -> bool:
@@ -136,8 +157,12 @@ class PromptNormalizer:
             )
         )
 
+        attack_result_id = _current_attack_result_id.get()
         for piece in request.message_pieces:
             piece.conversation_id = conversation_id
+            piece.prompt_metadata.pop(MessagePiece.ATTACK_RESULT_ID_METADATA_KEY, None)
+            if attack_result_id is not None:
+                piece.prompt_metadata[MessagePiece.ATTACK_RESULT_ID_METADATA_KEY] = attack_result_id
 
         await self.convert_values_async(
             converter_configurations=request_converter_configurations,
@@ -188,6 +213,7 @@ class PromptNormalizer:
             )
             error_response.get_piece().prompt_metadata.pop(RequestTraceContext.METADATA_KEY, None)
             error_response.get_piece().prompt_metadata.pop(RequestTraceContext.REQUEST_METADATA_KEY, None)
+            error_response.get_piece().prompt_metadata.pop(MessagePiece.ATTACK_RESULT_ID_METADATA_KEY, None)
 
             await self._calc_hash_async(request=error_response)
             (await self.memory.add_message_to_memory_async(request=error_response))
@@ -208,6 +234,7 @@ class PromptNormalizer:
             )
             empty_response.get_piece().prompt_metadata.pop(RequestTraceContext.METADATA_KEY, None)
             empty_response.get_piece().prompt_metadata.pop(RequestTraceContext.REQUEST_METADATA_KEY, None)
+            empty_response.get_piece().prompt_metadata.pop(MessagePiece.ATTACK_RESULT_ID_METADATA_KEY, None)
             await self._calc_hash_async(request=empty_response)
             (await self.memory.add_message_to_memory_async(request=empty_response))
             return empty_response
@@ -223,6 +250,7 @@ class PromptNormalizer:
                 piece.conversation_id = conversation_id
                 piece.prompt_metadata.pop(RequestTraceContext.METADATA_KEY, None)
                 piece.prompt_metadata.pop(RequestTraceContext.REQUEST_METADATA_KEY, None)
+                piece.prompt_metadata.pop(MessagePiece.ATTACK_RESULT_ID_METADATA_KEY, None)
             is_last = i == len(responses) - 1
             if is_last:
                 await self.convert_values_async(

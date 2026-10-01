@@ -119,6 +119,7 @@ Scores enable automated evaluation of attack success, content harmfulness, and o
 
 **Key Fields:**
 
+- **`attack_result_id`**: Unique ID of the result, allocated when the attack starts
 - **`conversation_id`**: The conversation that produced this result
 - **`objective`**: Natural-language description of the attacker's goal
 - **`atomic_attack_identifier`**: Composite `ComponentIdentifier` combining the attack technique with seed identifiers from the dataset (see [ComponentIdentifiers](#componentidentifiers) below)
@@ -133,6 +134,20 @@ Scores enable automated evaluation of attack success, content harmfulness, and o
 - **`targeted_harm_categories`**: Harm categories this attack targeted, auto-populated from the attack's seed group
 
 `AttackResult` objects provide comprehensive reporting on attack campaigns, enabling analysis of red teaming effectiveness and vulnerability identification.
+
+### Correlating an Attack's Requests
+
+An attack allocates the ID of its `AttackResult` when execution starts. Every request the `PromptNormalizer` persists while the attack runs records that ID in `prompt_metadata` under `MessagePiece.ATTACK_RESULT_ID_METADATA_KEY`. This covers the main conversation and related ones, such as adversarial chat and scoring exchanges, so a scorer or harness can find everything an attack sent:
+
+```python
+pieces = await memory.get_message_pieces_async(
+    prompt_metadata={MessagePiece.ATTACK_RESULT_ID_METADATA_KEY: result.attack_result_id}
+)
+```
+
+Responses and copied history, such as a prepended conversation taken from another attack, do not carry the ID. A request sent by a child attack, for example inside `SequentialAttack`, carries the child's result ID. During execution the ID is also available as `AttackContext.attack_result_id`.
+
+Targets receive the ID on each request, which lets a harness attach it at the point evidence is created. A custom target can read it from the current request (the last message of `normalized_conversation`) and pass it to the system under test, which can then tag the files, logs or traces it writes for that attack.
 
 ## ComponentIdentifiers
 
