@@ -43,6 +43,7 @@ from pyrit.prompt_target.common.target_capabilities import (
     get_known_capabilities,
 )
 from pyrit.prompt_target.common.target_configuration import TargetConfiguration
+from pyrit.prompt_target.common.target_trace_config import TargetTraceConfig, request_trace_headers
 from pyrit.prompt_target.common.tool_call_history import TOOL_CALL_INPUT_MODALITIES
 from pyrit.prompt_target.common.utils import (
     limit_requests_per_minute,
@@ -163,6 +164,10 @@ class LiteLLMChatTarget(PromptTarget):
             lookup and identification when the provider/model string differs from a known model.
         max_requests_per_minute: Client-side request cap.
         custom_configuration: Override the derived target configuration.
+        trace_config: Request tracing configuration. Tracing is disabled by default because a
+            provider or gateway is not known to accept W3C trace context. Pass
+            ``TargetTraceConfig(enabled=True)`` for an instrumented endpoint; each request then
+            sends a fresh ``traceparent`` in ``extra_headers``.
     """
 
     # Fallback only. The real per-instance configuration is normally derived from LiteLLM's
@@ -199,6 +204,7 @@ class LiteLLMChatTarget(PromptTarget):
         underlying_model: str | None = None,
         max_requests_per_minute: int | None = None,
         custom_configuration: TargetConfiguration | None = None,
+        trace_config: TargetTraceConfig | None = None,
     ) -> None:
         """
         Initialize a LiteLLMChatTarget.
@@ -218,6 +224,7 @@ class LiteLLMChatTarget(PromptTarget):
             underlying_model=underlying_model,
             max_requests_per_minute=max_requests_per_minute,
             custom_configuration=custom_configuration,
+            trace_config=trace_config,
         )
 
         # Resolve api_key: explicit value/callable > LITELLM_API_KEY env var > None (LiteLLM
@@ -382,6 +389,13 @@ class LiteLLMChatTarget(PromptTarget):
         messages = await self._build_chat_messages_async(normalized_conversation)
         api_key = await self._resolve_api_key_async()
         body = self._construct_request_body(messages=messages, json_config=json_config, api_key=api_key)
+        # Applied after the passthrough merge so ``extra_body_parameters`` cannot drop the context.
+        # LiteLLM merges ``headers`` with ``extra_headers``, so both are checked for manual values.
+        trace_headers = request_trace_headers(
+            request=message, headers=body.get("extra_headers") or {}, default_headers=body.get("headers")
+        )
+        if trace_headers:
+            body["extra_headers"] = trace_headers
 
         try:
             response = await litellm.acompletion(**body)
