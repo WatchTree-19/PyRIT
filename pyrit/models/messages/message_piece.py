@@ -47,8 +47,6 @@ class MessagePiece(BaseModel):
     STRUCTURED_REFUSAL_METADATA_KEY: ClassVar[str] = "structured_refusal"
     TRUNCATED_METADATA_KEY: ClassVar[str] = "truncated"
     PREPENDED_HISTORY_METADATA_KEY: ClassVar[str] = "prepended_history"
-    # Request metadata naming the attack result a request belongs to. Set by the prompt normalizer.
-    ATTACK_RESULT_ID_METADATA_KEY: ClassVar[str] = "pyrit_attack_result_id"
 
     model_config = ConfigDict(
         arbitrary_types_allowed=True,
@@ -139,7 +137,6 @@ class MessagePiece(BaseModel):
         self.prompt_metadata[self.PREPENDED_HISTORY_METADATA_KEY] = True
         self.prompt_metadata.pop(RequestTraceContext.METADATA_KEY, None)
         self.prompt_metadata.pop(RequestTraceContext.REQUEST_METADATA_KEY, None)
-        self.prompt_metadata.pop(self.ATTACK_RESULT_ID_METADATA_KEY, None)
 
     def to_message(self) -> Message:
         """

@@ -384,24 +384,6 @@ async def test_send_prompt_async_request_response_added_to_memory(mock_memory_in
     )
 
 
-async def test_send_prompt_async_outside_attack_drops_attack_result_id(mock_memory_instance):
-    stale = {MessagePiece.ATTACK_RESULT_ID_METADATA_KEY: "earlier-attack"}
-    prompt_target = MagicMock()
-    prompt_target.get_identifier.return_value = get_mock_target_identifier("MockTarget")
-    response = MessagePiece(role="assistant", original_value="reply", prompt_metadata=dict(stale)).to_message()
-    prompt_target.send_prompt_async = AsyncMock(return_value=[response])
-    message = MessagePiece(role="user", original_value="hello", prompt_metadata=dict(stale)).to_message()
-
-    await PromptNormalizer().send_prompt_async(message=message, target=prompt_target)
-
-    stored = [
-        call.kwargs["request"].get_piece() for call in mock_memory_instance.add_message_to_memory_async.call_args_list
-    ]
-    assert [piece.role for piece in stored] == ["user", "assistant"]
-    assert all(MessagePiece.ATTACK_RESULT_ID_METADATA_KEY not in piece.prompt_metadata for piece in stored)
-    assert message.get_piece().prompt_metadata == stale
-
-
 async def test_send_prompt_async_exception(mock_memory_instance, seed_group):
     prompt_target = MagicMock()
     prompt_target.send_prompt_async = AsyncMock(side_effect=ValueError("test_exception"))

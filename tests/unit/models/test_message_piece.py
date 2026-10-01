@@ -49,16 +49,6 @@ def test_simulated_history_provenance(
     assert RequestTraceContext.REQUEST_METADATA_KEY not in restored.prompt_metadata
 
 
-def test_simulated_history_drops_attack_result_id() -> None:
-    piece = MessagePiece(
-        role="user",
-        original_value="history",
-        prompt_metadata={MessagePiece.ATTACK_RESULT_ID_METADATA_KEY: "earlier-attack"},
-    )
-    piece.set_simulated_role()
-    assert MessagePiece.ATTACK_RESULT_ID_METADATA_KEY not in piece.prompt_metadata
-
-
 @pytest.fixture
 def sample_conversations() -> MutableSequence[Message]:
     return get_sample_conversations()

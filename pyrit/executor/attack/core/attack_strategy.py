@@ -44,7 +44,7 @@ from pyrit.models import (
     TargetIdentifier,
     UndeterminedScoreError,
 )
-from pyrit.prompt_normalizer.prompt_normalizer import attack_result_id_scope
+from pyrit.models.results.attack_result_scope import attack_result_id_scope
 from pyrit.prompt_target.common.target_requirements import TargetRequirements
 
 if TYPE_CHECKING:
@@ -236,8 +236,8 @@ class AttackContext(StrategyContext, ABC, Generic[AttackParamsT]):
         """
         The ID of the result this execution produces, or None before execution starts.
 
-        The prompt normalizer records it on every request sent while the attack runs,
-        under ``MessagePiece.ATTACK_RESULT_ID_METADATA_KEY``.
+        Conversations created while the attack runs are linked to it through
+        ``Conversation.attack_result_id``.
         """
         return self._attack_result_id
 

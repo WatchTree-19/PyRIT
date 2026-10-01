@@ -621,7 +621,7 @@ async def test_benchmark_typed_expectation_end_to_end_async(
     )
     sent = send.call_args.kwargs["message"]
     assert sent.get_value() == sample_question_entry.question
-    assert sent.get_piece().prompt_metadata == {MessagePiece.ATTACK_RESULT_ID_METADATA_KEY: result.attack_result_id}
+    assert not sent.get_piece().prompt_metadata
     assert "Paris" not in sent.get_value()
 
 

@@ -135,19 +135,18 @@ Scores enable automated evaluation of attack success, content harmfulness, and o
 
 `AttackResult` objects provide comprehensive reporting on attack campaigns, enabling analysis of red teaming effectiveness and vulnerability identification.
 
-### Correlating an Attack's Requests
+### Conversations Owned by an Attack
 
-An attack allocates the ID of its `AttackResult` when execution starts. Every request the `PromptNormalizer` persists while the attack runs records that ID in `prompt_metadata` under `MessagePiece.ATTACK_RESULT_ID_METADATA_KEY`. This covers the main conversation and related ones, such as adversarial chat and scoring exchanges, so a scorer or harness can find everything an attack sent:
+An attack allocates the ID of its `AttackResult` when execution starts. Every conversation registered while the attack runs is linked to that ID through `Conversation.attack_result_id`, which is stored on the `Conversations` table. This covers the objective conversation and related ones, such as adversarial chat, scoring, converter and branch conversations, so a scorer or harness can find everything an attack exchanged:
 
 ```python
-pieces = await memory.get_message_pieces_async(
-    prompt_metadata={MessagePiece.ATTACK_RESULT_ID_METADATA_KEY: result.attack_result_id}
-)
+conversations = await memory.get_attack_result_conversations_async(attack_result_id=result.attack_result_id)
+pieces = await memory.get_message_pieces_async(attack_result_id=result.attack_result_id)
 ```
 
-Responses and copied history, such as a prepended conversation taken from another attack, do not carry the ID. A request sent by a child attack, for example inside `SequentialAttack`, carries the child's result ID. During execution the ID is also available as `AttackContext.attack_result_id`.
+A conversation belongs to one attack execution. Registering a conversation that is already linked to a different execution raises a `ValueError`. Copies made during an execution, for example when an attack backtracks or branches, belong to that execution. History taken from an earlier attack, such as a prepended conversation, is copied into a new conversation owned by the new execution, and the original keeps its link. Conversations created by a child attack, for example inside `SequentialAttack`, are linked to the child's result ID. Conversations created outside an attack execution have no link.
 
-Targets receive the ID on each request, which lets a harness attach it at the point evidence is created. A custom target can read it from the current request (the last message of `normalized_conversation`) and pass it to the system under test, which can then tag the files, logs or traces it writes for that attack.
+During execution the ID is available as `AttackContext.attack_result_id`, and `get_current_attack_result_id()` from `pyrit.models` returns it to any code running within the attack, including targets, scorers and converters. A custom target can read it before it sends and pass it to the system under test, which can then tag the files, logs or traces it writes for that attack.
 
 ## ComponentIdentifiers
 
