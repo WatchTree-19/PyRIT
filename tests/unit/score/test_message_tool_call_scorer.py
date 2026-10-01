@@ -3,6 +3,7 @@
 
 import json
 import uuid
+from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -19,6 +20,7 @@ from pyrit.models import (
     ScoreStatus,
     ScoringExpectation,
     ToolCallRequirement,
+    ToolExecutionMetadata,
     ToolsCalled,
 )
 from pyrit.prompt_target import OpenAIResponseTarget
@@ -59,13 +61,14 @@ class _Conversation:
         self.conversation_id = str(uuid.uuid4())
         self.add("user", "text", "use the tools")
 
-    def add(self, role: str, data_type: str, value: object) -> Message:
+    def add(self, role: str, data_type: str, value: object, *, metadata: dict[str, Any] | None = None) -> Message:
         text = value if isinstance(value, str) else json.dumps(value, separators=(",", ":"))
         piece = MessagePiece(
             role=role,
             original_value=text,
             original_value_data_type=data_type,
             conversation_id=self.conversation_id,
+            prompt_metadata=metadata or {},
         )
         message = piece.to_message()
         self._memory.add_message_to_memory(request=message)
@@ -144,7 +147,17 @@ async def test_tolerant_dispatch_error_is_not_execution_async(sqlite_instance: S
     assert score.status == ScoreStatus.UNDETERMINED
 
 
-@pytest.mark.parametrize("output", [{"error": "function_not_found"}, {"error": "rate limited"}, "not json", ""])
+@pytest.mark.parametrize(
+    "output",
+    [
+        {"error": "function_not_found"},
+        {"error": "rate limited"},
+        {"error": {"code": "timeout"}},
+        {"error": ["timeout"]},
+        "not json",
+        "",
+    ],
+)
 async def test_tool_reported_error_still_counts_as_execution_async(sqlite_instance: SQLiteMemory, output) -> None:
     conversation = _Conversation(sqlite_instance)
     conversation.call(_responses_call("call_1", "lookup"))
@@ -152,6 +165,55 @@ async def test_tool_reported_error_still_counts_as_execution_async(sqlite_instan
     reply = conversation.reply()
 
     assert (await _score(reply, "lookup")).get_value() is True
+
+
+async def test_unrelated_structured_error_does_not_abort_scoring_async(sqlite_instance: SQLiteMemory) -> None:
+    conversation = _Conversation(sqlite_instance)
+    conversation.call(_responses_call("other", "other_tool"))
+    conversation.output("other", {"error": {"code": "timeout"}})
+    conversation.call(_responses_call("call_1", "lookup"))
+    conversation.output("call_1")
+
+    assert (await _score(conversation.reply(), "lookup")).get_value() is True
+
+
+@pytest.mark.parametrize("invoked", [True, False])
+@pytest.mark.parametrize("output", ["ok", {"error": "malformed_arguments", "raw_arguments": "{"}])
+async def test_stored_execution_metadata_controls_verdict_async(
+    sqlite_instance: SQLiteMemory, invoked: bool, output: object
+) -> None:
+    conversation = _Conversation(sqlite_instance)
+    conversation.call(_responses_call("call_1", "lookup"))
+    result = conversation.add(
+        "tool",
+        "function_call_output",
+        _output("call_1", output),
+        metadata=ToolExecutionMetadata(invoked=invoked).to_metadata(),
+    )
+    stored = await sqlite_instance.get_message_pieces_async(prompt_ids=[str(result.get_piece().id)])
+    assert ToolExecutionMetadata.from_metadata(metadata=stored[0].prompt_metadata) == ToolExecutionMetadata(
+        invoked=invoked
+    )
+
+    score = await _score(conversation.reply(), "lookup")
+    if invoked:
+        assert score.get_value() is True
+    else:
+        assert score.status == ScoreStatus.UNDETERMINED
+
+
+async def test_invalid_execution_metadata_is_not_a_legacy_fallback_async(sqlite_instance: SQLiteMemory) -> None:
+    conversation = _Conversation(sqlite_instance)
+    conversation.call(_responses_call("call_1", "lookup"))
+    conversation.add(
+        "tool",
+        "function_call_output",
+        _output("call_1", "ok"),
+        metadata={ToolExecutionMetadata.METADATA_KEY: {"invoked": "false"}},
+    )
+
+    with pytest.raises(RuntimeError, match="invoked"):
+        await _score(conversation.reply(), "lookup")
 
 
 async def test_output_must_pair_by_call_id_async(sqlite_instance: SQLiteMemory) -> None:
@@ -253,7 +315,12 @@ async def test_calls_the_model_did_not_make_are_ignored_async(sqlite_instance: S
 async def test_simulated_tool_output_is_not_execution_async(sqlite_instance: SQLiteMemory) -> None:
     conversation = _Conversation(sqlite_instance)
     conversation.call(_responses_call("call_1", "lookup"))
-    conversation.output("call_1", role="simulated_tool")
+    conversation.add(
+        "simulated_tool",
+        "function_call_output",
+        _output("call_1", "ok"),
+        metadata=ToolExecutionMetadata(invoked=True).to_metadata(),
+    )
     reply = conversation.reply()
 
     assert (await _score(reply, "lookup")).status == ScoreStatus.UNDETERMINED
@@ -330,16 +397,18 @@ def _sdk_text(text: str) -> MagicMock:
     ("registered", "outcome"),
     [(True, AttackOutcome.SUCCESS), (False, AttackOutcome.UNDETERMINED)],
 )
-async def test_scores_the_response_target_tool_loop_async(registered: bool, outcome: AttackOutcome) -> None:
+async def test_scores_the_response_target_tool_loop_async(
+    registered: bool, outcome: AttackOutcome, sqlite_instance: SQLiteMemory
+) -> None:
     target = OpenAIResponseTarget(
         model_name="gpt-4", endpoint="https://mock.azure.com", api_key="mock-key", fail_on_missing_function=False
     )
     if registered:
 
-        async def lookup(args: dict) -> dict:
-            return {"found": True}
+        async def lookup_async(args: dict) -> dict:
+            return {"error": "function_not_found", "missing_function": "lookup", "available_functions": []}
 
-        target._custom_functions["lookup"] = lookup
+        target._custom_functions["lookup"] = lookup_async
     attack = PromptSendingAttack(
         objective_target=target,
         attack_scoring_config=AttackScoringConfig(objective_scorer=MessageToolCallScorer()),
@@ -352,3 +421,14 @@ async def test_scores_the_response_target_tool_loop_async(registered: bool, outc
     assert result.outcome is outcome
     assert result.automated_score is not None
     assert result.automated_score.message_piece_id == result.last_response.id
+    pieces = await sqlite_instance.get_message_pieces_async(conversation_id=result.last_response.conversation_id)
+    outputs = [piece for piece in pieces if piece.original_value_data_type == "function_call_output"]
+    assert len(outputs) == 1
+    assert ToolExecutionMetadata.from_metadata(metadata=outputs[0].prompt_metadata) == ToolExecutionMetadata(
+        invoked=registered
+    )
+    assert json.loads(json.loads(outputs[0].original_value)["output"]) == {
+        "error": "function_not_found",
+        "missing_function": "lookup",
+        "available_functions": [],
+    }

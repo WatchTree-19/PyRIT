@@ -10,7 +10,7 @@ from typing import TYPE_CHECKING, Any
 
 from pydantic import ValidationError
 
-from pyrit.models import MessageScorable, Score, ToolsCalled
+from pyrit.models import MessageScorable, Score, ToolExecutionMetadata, ToolsCalled
 from pyrit.models.messages.tool_content import FunctionCallContent, FunctionOutputContent
 from pyrit.score.message_scorable_resolver import MessageScorableResolver
 from pyrit.score.true_false.true_false_scorer import TrueFalseScorer
@@ -20,8 +20,7 @@ if TYPE_CHECKING:
 
     from pyrit.models import ComponentIdentifier, MessagePiece, Scorable, ScoringExpectation
 
-# Outputs PyRIT writes in tolerant mode when it could not run the requested function. Each code is
-# paired with a key the dispatcher always sets, so a tool's own "error" field is not mistaken for one.
+# Legacy outputs have no dispatch metadata. Matching payloads remain ambiguous and cannot prove invocation.
 _DISPATCH_ERRORS = {
     "function_not_found": "missing_function",
     "missing_function_name": "tool_call_section",
@@ -74,9 +73,14 @@ def _executed_call_id(piece: MessagePiece) -> str | None:
         content = FunctionOutputContent.model_validate_json(piece.converted_value)
     except ValidationError:
         return None
+    execution = ToolExecutionMetadata.from_metadata(metadata=piece.prompt_metadata)
+    if execution is not None:
+        return content.call_id if execution.invoked else None
     output = content.output
     result = _json_object(output) if isinstance(output, str) else output if isinstance(output, dict) else None
-    if result is not None and _DISPATCH_ERRORS.get(result.get("error")) in result:
+    error_code = result.get("error") if result is not None else None
+    marker_key = _DISPATCH_ERRORS.get(error_code) if isinstance(error_code, str) else None
+    if result is not None and marker_key is not None and marker_key in result:
         return None
     return content.call_id
 
@@ -85,8 +89,8 @@ def match_message_tool_calls(*, pieces: Iterable[MessagePiece]) -> set[str]:
     """
     Return the names of functions that ran, pairing each request with its output by call id.
 
-    A request with no output, or whose output reports that PyRIT could not dispatch it, is not
-    counted: a model asking for a tool is not evidence that the tool was invoked.
+    A request with no output or a recorded dispatch failure is not counted. Legacy outputs shaped
+    like dispatch failures remain ambiguous: a requested call alone does not prove invocation.
 
     Returns:
         set[str]: Names of functions with an execution attempt in the given pieces.
@@ -114,7 +118,7 @@ class MessageToolCallScorer(TrueFalseScorer):
     CONDITION_TYPE = ToolsCalled
 
     def _build_identifier(self) -> ComponentIdentifier:
-        return self._create_identifier(params={"matching_version": 1, "message_scope_version": 1})
+        return self._create_identifier(params={"matching_version": 2, "message_scope_version": 1})
 
     async def _score_scorable_async(self, *, scorable: Scorable, expectation: ScoringExpectation | None) -> list[Score]:
         if not isinstance(scorable, MessageScorable):
