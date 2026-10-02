@@ -59,9 +59,16 @@ class _Conversation:
     def __init__(self, memory: SQLiteMemory) -> None:
         self._memory = memory
         self.conversation_id = str(uuid.uuid4())
-        self.add("user", "text", "use the tools")
 
-    def add(self, role: str, data_type: str, value: object, *, metadata: dict[str, Any] | None = None) -> Message:
+    @classmethod
+    async def create_async(cls, *, memory: SQLiteMemory) -> "_Conversation":
+        conversation = cls(memory)
+        await conversation.add_async("user", "text", "use the tools")
+        return conversation
+
+    async def add_async(
+        self, role: str, data_type: str, value: object, *, metadata: dict[str, Any] | None = None
+    ) -> Message:
         text = value if isinstance(value, str) else json.dumps(value, separators=(",", ":"))
         piece = MessagePiece(
             role=role,
@@ -71,17 +78,17 @@ class _Conversation:
             prompt_metadata=metadata or {},
         )
         message = piece.to_message()
-        self._memory.add_message_to_memory(request=message)
+        await self._memory.add_message_to_memory_async(request=message)
         return message
 
-    def call(self, call: dict, *, role: str = "assistant") -> Message:
-        return self.add(role, "function_call", call)
+    async def call_async(self, call: dict, *, role: str = "assistant") -> Message:
+        return await self.add_async(role, "function_call", call)
 
-    def output(self, call_id: str, output: object = "ok", *, role: str = "tool") -> Message:
-        return self.add(role, "function_call_output", _output(call_id, output))
+    async def output_async(self, call_id: str, output: object = "ok", *, role: str = "tool") -> Message:
+        return await self.add_async(role, "function_call_output", _output(call_id, output))
 
-    def reply(self, text: str = "done") -> Message:
-        return self.add("assistant", "text", text)
+    async def reply_async(self, text: str = "done") -> Message:
+        return await self.add_async("assistant", "text", text)
 
 
 async def _score(message: Message, *names: str):
@@ -93,10 +100,10 @@ async def _score(message: Message, *names: str):
 
 @pytest.mark.parametrize("call_format", [_responses_call, _chat_completions_call])
 async def test_paired_output_is_true_async(sqlite_instance: SQLiteMemory, call_format) -> None:
-    conversation = _Conversation(sqlite_instance)
-    conversation.call(call_format("call_1", "lookup"))
-    conversation.output("call_1")
-    reply = conversation.reply()
+    conversation = await _Conversation.create_async(memory=sqlite_instance)
+    await conversation.call_async(call_format("call_1", "lookup"))
+    await conversation.output_async("call_1")
+    reply = await conversation.reply_async()
 
     score = await _score(reply, "lookup")
 
@@ -109,8 +116,8 @@ async def test_paired_output_is_true_async(sqlite_instance: SQLiteMemory, call_f
 
 @pytest.mark.parametrize("call_format", [_responses_call, _chat_completions_call])
 async def test_requested_call_without_output_is_undetermined_async(sqlite_instance: SQLiteMemory, call_format) -> None:
-    conversation = _Conversation(sqlite_instance)
-    request = conversation.call(call_format("call_1", "lookup"))
+    conversation = await _Conversation.create_async(memory=sqlite_instance)
+    request = await conversation.call_async(call_format("call_1", "lookup"))
 
     score = await _score(request, "lookup")
 
@@ -120,7 +127,8 @@ async def test_requested_call_without_output_is_undetermined_async(sqlite_instan
 
 
 async def test_no_tool_evidence_is_undetermined_not_false_async(sqlite_instance: SQLiteMemory) -> None:
-    reply = _Conversation(sqlite_instance).reply()
+    conversation = await _Conversation.create_async(memory=sqlite_instance)
+    reply = await conversation.reply_async()
 
     score = await _score(reply, "lookup")
 
@@ -137,10 +145,10 @@ async def test_no_tool_evidence_is_undetermined_not_false_async(sqlite_instance:
     ],
 )
 async def test_tolerant_dispatch_error_is_not_execution_async(sqlite_instance: SQLiteMemory, dispatch_error) -> None:
-    conversation = _Conversation(sqlite_instance)
-    conversation.call(_responses_call("call_1", "lookup"))
-    conversation.output("call_1", dispatch_error)
-    reply = conversation.reply()
+    conversation = await _Conversation.create_async(memory=sqlite_instance)
+    await conversation.call_async(_responses_call("call_1", "lookup"))
+    await conversation.output_async("call_1", dispatch_error)
+    reply = await conversation.reply_async()
 
     score = await _score(reply, "lookup")
 
@@ -159,22 +167,22 @@ async def test_tolerant_dispatch_error_is_not_execution_async(sqlite_instance: S
     ],
 )
 async def test_tool_reported_error_still_counts_as_execution_async(sqlite_instance: SQLiteMemory, output) -> None:
-    conversation = _Conversation(sqlite_instance)
-    conversation.call(_responses_call("call_1", "lookup"))
-    conversation.output("call_1", output)
-    reply = conversation.reply()
+    conversation = await _Conversation.create_async(memory=sqlite_instance)
+    await conversation.call_async(_responses_call("call_1", "lookup"))
+    await conversation.output_async("call_1", output)
+    reply = await conversation.reply_async()
 
     assert (await _score(reply, "lookup")).get_value() is True
 
 
 async def test_unrelated_structured_error_does_not_abort_scoring_async(sqlite_instance: SQLiteMemory) -> None:
-    conversation = _Conversation(sqlite_instance)
-    conversation.call(_responses_call("other", "other_tool"))
-    conversation.output("other", {"error": {"code": "timeout"}})
-    conversation.call(_responses_call("call_1", "lookup"))
-    conversation.output("call_1")
+    conversation = await _Conversation.create_async(memory=sqlite_instance)
+    await conversation.call_async(_responses_call("other", "other_tool"))
+    await conversation.output_async("other", {"error": {"code": "timeout"}})
+    await conversation.call_async(_responses_call("call_1", "lookup"))
+    await conversation.output_async("call_1")
 
-    assert (await _score(conversation.reply(), "lookup")).get_value() is True
+    assert (await _score(await conversation.reply_async(), "lookup")).get_value() is True
 
 
 @pytest.mark.parametrize("invoked", [True, False])
@@ -182,9 +190,9 @@ async def test_unrelated_structured_error_does_not_abort_scoring_async(sqlite_in
 async def test_stored_execution_metadata_controls_verdict_async(
     sqlite_instance: SQLiteMemory, invoked: bool, output: object
 ) -> None:
-    conversation = _Conversation(sqlite_instance)
-    conversation.call(_responses_call("call_1", "lookup"))
-    result = conversation.add(
+    conversation = await _Conversation.create_async(memory=sqlite_instance)
+    await conversation.call_async(_responses_call("call_1", "lookup"))
+    result = await conversation.add_async(
         "tool",
         "function_call_output",
         _output("call_1", output),
@@ -195,7 +203,7 @@ async def test_stored_execution_metadata_controls_verdict_async(
         invoked=invoked
     )
 
-    score = await _score(conversation.reply(), "lookup")
+    score = await _score(await conversation.reply_async(), "lookup")
     if invoked:
         assert score.get_value() is True
     else:
@@ -203,9 +211,9 @@ async def test_stored_execution_metadata_controls_verdict_async(
 
 
 async def test_invalid_execution_metadata_is_not_a_legacy_fallback_async(sqlite_instance: SQLiteMemory) -> None:
-    conversation = _Conversation(sqlite_instance)
-    conversation.call(_responses_call("call_1", "lookup"))
-    conversation.add(
+    conversation = await _Conversation.create_async(memory=sqlite_instance)
+    await conversation.call_async(_responses_call("call_1", "lookup"))
+    await conversation.add_async(
         "tool",
         "function_call_output",
         _output("call_1", "ok"),
@@ -213,25 +221,25 @@ async def test_invalid_execution_metadata_is_not_a_legacy_fallback_async(sqlite_
     )
 
     with pytest.raises(RuntimeError, match="invoked"):
-        await _score(conversation.reply(), "lookup")
+        await _score(await conversation.reply_async(), "lookup")
 
 
 async def test_output_must_pair_by_call_id_async(sqlite_instance: SQLiteMemory) -> None:
-    conversation = _Conversation(sqlite_instance)
-    conversation.call(_responses_call("call_1", "lookup"))
-    conversation.call(_responses_call("call_2", "delete"))
-    conversation.output("call_2")
-    reply = conversation.reply()
+    conversation = await _Conversation.create_async(memory=sqlite_instance)
+    await conversation.call_async(_responses_call("call_1", "lookup"))
+    await conversation.call_async(_responses_call("call_2", "delete"))
+    await conversation.output_async("call_2")
+    reply = await conversation.reply_async()
 
     assert (await _score(reply, "delete")).get_value() is True
     assert (await _score(reply, "lookup")).status == ScoreStatus.UNDETERMINED
 
 
 async def test_output_for_an_unknown_call_is_ignored_async(sqlite_instance: SQLiteMemory) -> None:
-    conversation = _Conversation(sqlite_instance)
-    conversation.call(_responses_call("call_1", "lookup"))
-    conversation.output("call_9")
-    reply = conversation.reply()
+    conversation = await _Conversation.create_async(memory=sqlite_instance)
+    await conversation.call_async(_responses_call("call_1", "lookup"))
+    await conversation.output_async("call_9")
+    reply = await conversation.reply_async()
 
     assert (await _score(reply, "lookup")).status == ScoreStatus.UNDETERMINED
 
@@ -240,31 +248,31 @@ async def test_output_for_an_unknown_call_is_ignored_async(sqlite_instance: SQLi
 async def test_only_tool_role_function_call_outputs_count_async(
     sqlite_instance: SQLiteMemory, role: str, data_type: str
 ) -> None:
-    conversation = _Conversation(sqlite_instance)
-    conversation.call(_responses_call("call_1", "lookup"))
-    conversation.add(role, data_type, _output("call_1", "ok"))
-    reply = conversation.reply()
+    conversation = await _Conversation.create_async(memory=sqlite_instance)
+    await conversation.call_async(_responses_call("call_1", "lookup"))
+    await conversation.add_async(role, data_type, _output("call_1", "ok"))
+    reply = await conversation.reply_async()
 
     assert (await _score(reply, "lookup")).status == ScoreStatus.UNDETERMINED
 
 
 async def test_output_before_its_request_is_ignored_async(sqlite_instance: SQLiteMemory) -> None:
-    conversation = _Conversation(sqlite_instance)
-    conversation.output("call_1")
-    conversation.call(_responses_call("call_1", "lookup"))
-    reply = conversation.reply()
+    conversation = await _Conversation.create_async(memory=sqlite_instance)
+    await conversation.output_async("call_1")
+    await conversation.call_async(_responses_call("call_1", "lookup"))
+    reply = await conversation.reply_async()
 
     assert (await _score(reply, "lookup")).status == ScoreStatus.UNDETERMINED
 
 
 async def test_every_required_tool_must_run_async(sqlite_instance: SQLiteMemory) -> None:
-    conversation = _Conversation(sqlite_instance)
-    conversation.call(_responses_call("call_1", "lookup"))
-    conversation.output("call_1")
-    partial = conversation.reply()
-    conversation.call(_responses_call("call_2", "summarize"))
-    conversation.output("call_2")
-    full = conversation.reply()
+    conversation = await _Conversation.create_async(memory=sqlite_instance)
+    await conversation.call_async(_responses_call("call_1", "lookup"))
+    await conversation.output_async("call_1")
+    partial = await conversation.reply_async()
+    await conversation.call_async(_responses_call("call_2", "summarize"))
+    await conversation.output_async("call_2")
+    full = await conversation.reply_async()
 
     missing = await _score(partial, "lookup", "summarize")
     assert missing.status == ScoreStatus.UNDETERMINED
@@ -274,69 +282,70 @@ async def test_every_required_tool_must_run_async(sqlite_instance: SQLiteMemory)
 
 
 async def test_tool_names_match_exactly_async(sqlite_instance: SQLiteMemory) -> None:
-    conversation = _Conversation(sqlite_instance)
-    conversation.call(_responses_call("call_1", "Lookup"))
-    conversation.output("call_1")
-    reply = conversation.reply()
+    conversation = await _Conversation.create_async(memory=sqlite_instance)
+    await conversation.call_async(_responses_call("call_1", "Lookup"))
+    await conversation.output_async("call_1")
+    reply = await conversation.reply_async()
 
     assert (await _score(reply, "lookup")).status == ScoreStatus.UNDETERMINED
 
 
 async def test_later_turns_are_not_evidence_for_an_earlier_message_async(sqlite_instance: SQLiteMemory) -> None:
-    conversation = _Conversation(sqlite_instance)
-    earlier = conversation.reply()
-    conversation.call(_responses_call("call_1", "lookup"))
-    conversation.output("call_1")
+    conversation = await _Conversation.create_async(memory=sqlite_instance)
+    earlier = await conversation.reply_async()
+    await conversation.call_async(_responses_call("call_1", "lookup"))
+    await conversation.output_async("call_1")
 
     assert (await _score(earlier, "lookup")).status == ScoreStatus.UNDETERMINED
 
 
 async def test_other_conversations_are_not_evidence_async(sqlite_instance: SQLiteMemory) -> None:
-    other = _Conversation(sqlite_instance)
-    other.call(_responses_call("call_1", "lookup"))
-    other.output("call_1")
-    conversation = _Conversation(sqlite_instance)
+    other = await _Conversation.create_async(memory=sqlite_instance)
+    await other.call_async(_responses_call("call_1", "lookup"))
+    await other.output_async("call_1")
+    conversation = await _Conversation.create_async(memory=sqlite_instance)
     for _ in range(3):
-        reply = conversation.reply()
+        reply = await conversation.reply_async()
 
     assert (await _score(reply, "lookup")).status == ScoreStatus.UNDETERMINED
 
 
 @pytest.mark.parametrize("role", ["simulated_assistant", "user"])
 async def test_calls_the_model_did_not_make_are_ignored_async(sqlite_instance: SQLiteMemory, role: str) -> None:
-    conversation = _Conversation(sqlite_instance)
-    conversation.call(_responses_call("call_1", "lookup"), role=role)
-    conversation.output("call_1")
-    reply = conversation.reply()
+    conversation = await _Conversation.create_async(memory=sqlite_instance)
+    await conversation.call_async(_responses_call("call_1", "lookup"), role=role)
+    await conversation.output_async("call_1")
+    reply = await conversation.reply_async()
 
     assert (await _score(reply, "lookup")).status == ScoreStatus.UNDETERMINED
 
 
 async def test_simulated_tool_output_is_not_execution_async(sqlite_instance: SQLiteMemory) -> None:
-    conversation = _Conversation(sqlite_instance)
-    conversation.call(_responses_call("call_1", "lookup"))
-    conversation.add(
+    conversation = await _Conversation.create_async(memory=sqlite_instance)
+    await conversation.call_async(_responses_call("call_1", "lookup"))
+    await conversation.add_async(
         "simulated_tool",
         "function_call_output",
         _output("call_1", "ok"),
         metadata=ToolExecutionMetadata(invoked=True).to_metadata(),
     )
-    reply = conversation.reply()
+    reply = await conversation.reply_async()
 
     assert (await _score(reply, "lookup")).status == ScoreStatus.UNDETERMINED
 
 
 async def test_function_call_text_in_a_reply_is_not_a_call_async(sqlite_instance: SQLiteMemory) -> None:
-    conversation = _Conversation(sqlite_instance)
-    conversation.add("assistant", "text", _responses_call("call_1", "lookup"))
-    conversation.output("call_1")
-    reply = conversation.reply()
+    conversation = await _Conversation.create_async(memory=sqlite_instance)
+    await conversation.add_async("assistant", "text", _responses_call("call_1", "lookup"))
+    await conversation.output_async("call_1")
+    reply = await conversation.reply_async()
 
     assert (await _score(reply, "lookup")).status == ScoreStatus.UNDETERMINED
 
 
 async def test_requires_a_tools_called_condition_async(sqlite_instance: SQLiteMemory) -> None:
-    reply = _Conversation(sqlite_instance).reply()
+    conversation = await _Conversation.create_async(memory=sqlite_instance)
+    reply = await conversation.reply_async()
 
     with pytest.raises(ValueError, match="ToolsCalled"):
         await MessageToolCallScorer().score_async(
@@ -354,11 +363,11 @@ async def test_rejects_loose_content_async() -> None:
 
 @pytest.mark.parametrize("executed", [True, False])
 async def test_composes_under_or_with_trace_scoring_async(sqlite_instance: SQLiteMemory, executed: bool) -> None:
-    conversation = _Conversation(sqlite_instance)
-    conversation.call(_responses_call("call_1", "lookup"))
+    conversation = await _Conversation.create_async(memory=sqlite_instance)
+    await conversation.call_async(_responses_call("call_1", "lookup"))
     if executed:
-        conversation.output("call_1")
-    reply = conversation.reply()
+        await conversation.output_async("call_1")
+    reply = await conversation.reply_async()
     client = InMemoryTraceClient()
     composite = TrueFalseCompositeScorer(
         scorers=[OtelToolCallScorer(source=OtelTraceSource(trace_client=client)), MessageToolCallScorer()],
