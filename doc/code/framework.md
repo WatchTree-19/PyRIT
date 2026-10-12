@@ -289,6 +289,12 @@ If you are contributing to PyRIT, that work will most likely land in one of the 
 - Surface sources read what a location holds for a `SurfaceScorable`, such as files under one
   root directory. `FileWriteScorer` evaluates its `ContentWritten` condition against that
   evidence. The caller owns workspace isolation; a snapshot does not identify its writer.
+- Observation lifecycle is optional. A scorer that implements `AttemptObserver` is asked by the
+  attack to start observing once its attempt ID is allocated, before anything is sent, and to
+  stop when the attempt ends. `FileWriteScorer` then records a baseline through a
+  `SurfaceLifecycleSource` and finalizes the snapshot against it, so it can claim that the
+  attempt wrote the content rather than only that the content is present. A source without
+  lifecycle support keeps the snapshot behavior.
 - Raw `ObservationSource` implementations acquire evidence without criteria.
   `ConversationSource` captures whole-conversation references; the conversation scorer owns
   role filtering and rendering. `TargetJudge` is a separate, expectation-bound collaborator:
