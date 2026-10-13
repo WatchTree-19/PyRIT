@@ -73,6 +73,9 @@ class SurfaceBaseline(BaseModel):
     ones hold content. Entries keep the same bounded evidence a snapshot keeps, so a criterion
     can compare what was there before with what is there now. A location the baseline did not
     cover cannot be attributed to the attempt.
+
+    ``concurrent`` is set when another attempt observed the same locations while this one ran.
+    A change can then have come from either attempt, so it is not credited to this one.
     """
 
     model_config = ConfigDict(frozen=True, extra="forbid")
@@ -80,6 +83,7 @@ class SurfaceBaseline(BaseModel):
     captured_at: AwareDatetime
     entries: tuple[SurfaceEntry, ...] = ()
     coverage: SurfaceCoverage = Field(default_factory=SurfaceCoverage)
+    concurrent: bool = False
 
     @model_validator(mode="after")
     def _validate_entries(self) -> SurfaceBaseline:

@@ -10,6 +10,7 @@ import time
 import traceback
 import uuid
 from abc import ABC
+from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import TYPE_CHECKING, Any, ClassVar, Generic, TypeVar, overload
@@ -53,7 +54,7 @@ from pyrit.prompt_target.common.target_requirements import TargetRequirements
 from pyrit.score.observation.lifecycle import AttemptObserver
 
 if TYPE_CHECKING:
-    from collections.abc import Callable
+    from collections.abc import AsyncGenerator, Callable
     from types import TracebackType
 
     from pyrit.executor.attack.component.prepended_conversation_config import (
@@ -70,6 +71,7 @@ if TYPE_CHECKING:
     from pyrit.message_normalizer import MessageListNormalizer
     from pyrit.prompt_target import PromptTarget
     from pyrit.prompt_target.common.target_capabilities import CapabilityName
+    from pyrit.score import Scorer
 
 AttackStrategyContextT = TypeVar("AttackStrategyContextT", bound="AttackContext[Any]")
 AttackStrategyResultT = TypeVar("AttackStrategyResultT", bound="AttackResult")
@@ -959,7 +961,7 @@ class AttackStrategy(Strategy[AttackStrategyContextT, AttackStrategyResultT], Id
             async with lifecycle:
                 try:
                     with attack_result_id_scope(attack_result_id=context._attack_result_id):
-                        result = await self._execute_observed_async(context=context)
+                        result = await super().execute_with_context_async(context=context)
                 except Exception as attack_error:
                     persistence_error = context._error_result_persistence_error
                     if persistence_error is not None:
@@ -983,41 +985,75 @@ class AttackStrategy(Strategy[AttackStrategyContextT, AttackStrategyResultT], Id
             context._persisted_attack_result_id = result.attack_result_id
         return result
 
-    async def _execute_observed_async(self, *, context: AttackStrategyContextT) -> AttackStrategyResultT:
+    @asynccontextmanager
+    async def _execution_context_async(self, context: AttackStrategyContextT) -> AsyncGenerator[None, None]:
         """
-        Run the attempt between its scorers' observation start and stop.
+        Set up the attempt, then observe it until it ends.
 
-        Scorers that observe evidence across an attempt record their baselines before the
-        attack sends anything, and release them when the attempt ends, whatever the outcome.
+        Scorers that observe evidence across an attempt record their baselines after setup and
+        before the attack sends anything. Starting inside the strategy's execution keeps a
+        failure to start within its error handling, so the attempt's error result is recorded
+        under its allocated ID like any other failure. Every observer is stopped when the attempt
+        ends, whatever the outcome.
 
         Args:
             context (AttackStrategyContextT): The attack execution context, with its
                 ``attack_result_id`` already allocated.
 
-        Returns:
-            AttackStrategyResultT: The attack result.
+        Yields:
+            None: Control returns to the strategy once observation has started.
 
         Raises:
             ValueError: If the attempt has no allocated ``attack_result_id``.
         """
-        attempt_id = context._attack_result_id
-        if attempt_id is None:
-            raise ValueError("An attempt must have its attack_result_id allocated before it is observed.")
-        started: list[AttemptObserver] = []
-        try:
-            for scorer, expectation in self._attempt_observers(context=context):
-                started.append(scorer)
-                await scorer.start_observing_async(attempt_id=attempt_id, expectation=expectation)
-            return await super().execute_with_context_async(context=context)
-        finally:
-            for scorer in started:
-                scorer.stop_observing(attempt_id=attempt_id)
+        async with super()._execution_context_async(context):
+            attempt_id = context._attack_result_id
+            if attempt_id is None:
+                raise ValueError("An attempt must have its attack_result_id allocated before it is observed.")
+            started: list[AttemptObserver] = []
+            try:
+                for scorer, expectation in self._attempt_observers(context=context):
+                    started.append(scorer)
+                    await scorer.start_observing_async(attempt_id=attempt_id, expectation=expectation)
+                yield
+            finally:
+                self._stop_observers(observers=started, attempt_id=attempt_id)
+
+    def _stop_observers(self, *, observers: list[AttemptObserver], attempt_id: str) -> None:
+        """
+        Stop every observer, reporting failures without replacing the attempt's outcome.
+
+        Each observer is stopped once, even when one stop fails, so a failing observer cannot
+        leave another holding the attempt's state or replace the error, cancellation, or result
+        already in flight.
+
+        Args:
+            observers (list[AttemptObserver]): The observers that were asked to start.
+            attempt_id (str): The attempt being released.
+        """
+        stopped: set[int] = set()
+        for observer in observers:
+            if id(observer) in stopped:
+                continue
+            stopped.add(id(observer))
+            try:
+                observer.stop_observing(attempt_id=attempt_id)
+            except Exception as error:  # noqa: BLE001 - cleanup must not replace the attack outcome
+                self._logger.warning(
+                    "Failed to stop %s observing attempt %s: %s",
+                    type(observer).__name__,
+                    attempt_id,
+                    error,
+                )
 
     def _attempt_observers(
         self, *, context: AttackStrategyContextT
     ) -> list[tuple[AttemptObserver, ScoringExpectation]]:
         """
         Pair each scorer that observes across an attempt with the expectation routed to it.
+
+        Wrapped scorers are included: each child is paired with the expectation its wrapper
+        routes to it, so wrapping a scorer does not change whether it observes the attempt.
 
         Returns:
             list[tuple[AttemptObserver, ScoringExpectation]]: Observing scorers and their expectations.
@@ -1032,15 +1068,19 @@ class AttackStrategy(Strategy[AttackStrategyContextT, AttackStrategyResultT], Id
             auxiliary_scorers=scoring_config.auxiliary_scorers,
             expectation=context.expectation,
         )
-        routed = [
+        pending: list[tuple[Scorer | None, ScoringExpectation | None]] = [
             (scoring_config.objective_scorer, prepared.objective_expectation),
             *zip(prepared.auxiliary_scorers, prepared.auxiliary_expectations, strict=True),
         ]
-        return [
-            (scorer, expectation)
-            for scorer, expectation in routed
-            if isinstance(scorer, AttemptObserver) and expectation is not None
-        ]
+        observers: list[tuple[AttemptObserver, ScoringExpectation]] = []
+        while pending:
+            scorer, expectation = pending.pop(0)
+            if scorer is None or expectation is None:
+                continue
+            if isinstance(scorer, AttemptObserver):
+                observers.append((scorer, expectation))
+            pending.extend(scorer._get_child_expectations(expectation=expectation))
+        return observers
 
     def _validate_scoring_expectation(self, *, context: AttackStrategyContextT) -> None:
         """Check execution criteria before setup unless child attacks own scoring."""

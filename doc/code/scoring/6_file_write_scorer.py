@@ -25,10 +25,13 @@
 # and clear the root before each attempt if you need write attribution. The caller owns this setup;
 # the scorer does not create or clear workspaces.
 #
-# Inside an attack, a source that supports the observation lifecycle removes that requirement. The
-# attack asks the scorer to record a baseline when its attempt starts, and scoring that attempt
-# compares each location with what it held before, so content counts only where the attempt
-# changed the location and added it.
+# Inside an attack, a source that supports the observation lifecycle removes the need to clear the
+# root. The attack asks the scorer to record a baseline when its attempt starts, and scoring that
+# attempt compares each location with what it held before, so content counts only where the attempt
+# changed the location and added it. A baseline cannot tell which of two overlapping attempts made a
+# change, so attempts that share a root must still run one at a time. If the scorer sees another
+# attempt observing the same location at the same time, it leaves a change undetermined rather than
+# crediting it.
 #
 # `ContentWritten.matcher` uses the same `Contains`, `Equals`, and `Regex` criteria as text scoring.
 # `Contains` ignores case by default. With no matcher, any nonempty content counts. Truncated text

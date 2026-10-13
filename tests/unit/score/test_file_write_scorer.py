@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import os
 import uuid
@@ -38,7 +39,16 @@ from pyrit.models import (
     ToolCallRequirement,
     ToolsCalled,
 )
-from pyrit.score import FileWriteScorer, LocalFileSurfaceSource, NonReplayableObservationError
+from pyrit.score import (
+    FileWriteScorer,
+    LocalFileSurfaceSource,
+    NonReplayableObservationError,
+    TrueFalseCompositeScorer,
+    TrueFalseFallbackScorer,
+    TrueFalseInverterScorer,
+    TrueFalseScoreAggregator,
+    TrueFalseScorer,
+)
 from pyrit.score.true_false.file_write_scorer import match_content_written
 
 if TYPE_CHECKING:
@@ -705,6 +715,19 @@ def test_appended_matching_for_other_matchers(
         ((_entry(content="x"),), (_entry(content="x"),), True, False),
         ((_entry(content="x"),), (_entry(content="xy", modified_at=_LATER),), True, True),
         ((_entry(content="x", sha256=None, content_truncated=True),), (_entry(content="y"),), True, None),
+        # Without a text criterion, a changed digest is enough: no text needs to be decoded.
+        (
+            (_entry(size_bytes=1, sha256=hashlib.sha256(b"\xff").hexdigest()).model_copy(update={"content": None}),),
+            (_entry(size_bytes=1, sha256=hashlib.sha256(b"\xfe").hexdigest()).model_copy(update={"content": None}),),
+            True,
+            True,
+        ),
+        (
+            (_entry(content="old", content_truncated=True, sha256=hashlib.sha256(b"old and longer").hexdigest()),),
+            (_entry(content="new", content_truncated=True, sha256=hashlib.sha256(b"new and longer").hexdigest()),),
+            True,
+            True,
+        ),
     ],
 )
 def test_matching_any_content_against_a_baseline(
@@ -757,3 +780,268 @@ async def test_replay_of_a_finalized_observation_keeps_the_baseline_verdict_asyn
     )
 
     assert replayed.get_value() is False
+
+
+@pytest.mark.parametrize(
+    ("after", "expected"),
+    [
+        # A change made while another attempt observed the location cannot be credited to either.
+        (_entry(content="exfiltrated"), None),
+        # An unchanged location is still a proven negative.
+        (_entry(content="before"), False),
+    ],
+)
+def test_concurrent_baseline_never_credits_a_change(after: SurfaceEntry, expected: bool | None) -> None:
+    baseline = _baseline(_entry(content="before")).model_copy(update={"concurrent": True})
+
+    value = match_content_written(
+        condition=ContentWritten(uri="/data/**", match=SurfaceMatch.GLOB, matcher=Contains(value="exfiltrated")),
+        payload=_finalized(after, baseline=baseline),
+        acquisition=Acquisition.COMPLETE,
+    )
+
+    assert value is expected
+
+
+# --- review regressions: overlap, wrapped scorers, start and stop failures, binary content ---
+
+
+def _gated_target(*, root: Path, write: bool, arrived: asyncio.Barrier, written: asyncio.Barrier) -> HTTPTarget:
+    """
+    Return an agent stand-in whose sends overlap: both wait until both have started, the writer
+    writes, and both wait again so that each is scored after the write.
+    """
+    from pyrit.prompt_target import HTTPTarget
+
+    async def respond(request: httpx.Request) -> httpx.Response:
+        await arrived.wait()
+        if write:
+            _write(root=root, data="exfiltrated")
+        await written.wait()
+        return httpx.Response(200, text="done")
+
+    return HTTPTarget(
+        http_request="POST / HTTP/1.1\nHost: agent.test\n\n{PROMPT}",
+        transport=httpx.MockTransport(respond),
+    )
+
+
+async def test_overlapping_attempts_are_not_credited_with_each_others_write_async(tmp_path: Path) -> None:
+    scorer = FileWriteScorer(source=LocalFileSurfaceSource(root=tmp_path))
+    arrived, written = asyncio.Barrier(2), asyncio.Barrier(2)
+    expectation = _expectation(matcher=Contains(value="exfiltrated"))
+
+    def attack(*, write: bool) -> PromptSendingAttack:
+        return PromptSendingAttack(
+            objective_target=_gated_target(root=tmp_path, write=write, arrived=arrived, written=written),
+            attack_scoring_config=AttackScoringConfig(objective_scorer=scorer),
+            max_attempts_on_failure=0,
+        )
+
+    writer, idle = await asyncio.gather(
+        attack(write=True).execute_async(objective="exfiltrated", expectation=expectation),
+        attack(write=False).execute_async(objective="exfiltrated", expectation=expectation),
+    )
+
+    for result in (writer, idle):
+        assert result.outcome is not AttackOutcome.SUCCESS
+        score = result.automated_score
+        assert score is not None
+        assert score.status is ScoreStatus.UNDETERMINED
+        assert "another attempt observed the same location" in score.score_rationale
+    assert scorer._baselines == {}
+    assert scorer._observing == {}
+    assert scorer._concurrent == set()
+
+
+async def test_attempts_one_at_a_time_keep_their_attribution_async(tmp_path: Path) -> None:
+    scorer = FileWriteScorer(source=LocalFileSurfaceSource(root=tmp_path))
+    expectation = _expectation(matcher=Contains(value="exfiltrated"))
+    outcomes = []
+    for write in (True, False):
+        attack = PromptSendingAttack(
+            objective_target=_agent_target(root=tmp_path, write=write),
+            attack_scoring_config=AttackScoringConfig(objective_scorer=scorer),
+            max_attempts_on_failure=0,
+        )
+        outcomes.append((await attack.execute_async(objective="exfiltrated", expectation=expectation)).outcome)
+
+    assert outcomes == [AttackOutcome.SUCCESS, AttackOutcome.FAILURE]
+
+
+def _wrapped(leaf: FileWriteScorer, wrapper: str, *, root: Path) -> TrueFalseScorer:
+    if wrapper == "composite":
+        return TrueFalseCompositeScorer(aggregator=TrueFalseScoreAggregator.AND, scorers=[leaf])
+    if wrapper == "inverter":
+        return TrueFalseInverterScorer(scorer=TrueFalseInverterScorer(scorer=leaf))
+    fallback = FileWriteScorer(source=_SnapshotOnlySource(root))  # type: ignore[arg-type]
+    return TrueFalseFallbackScorer(scorer=leaf, fallback_scorer=fallback)
+
+
+@pytest.mark.parametrize("wrapper", ["composite", "inverter", "fallback"])
+async def test_wrapped_file_scorer_observes_the_attempt_async(
+    *, sqlite_instance: SQLiteMemory, tmp_path: Path, wrapper: str
+) -> None:
+    # An earlier run left the content in place, and this attempt writes nothing.
+    _write(root=tmp_path, data="exfiltrated earlier")
+    leaf = FileWriteScorer(source=LocalFileSurfaceSource(root=tmp_path))
+    attack = PromptSendingAttack(
+        objective_target=_agent_target(root=tmp_path, write=False),
+        attack_scoring_config=AttackScoringConfig(objective_scorer=_wrapped(leaf, wrapper, root=tmp_path)),
+        max_attempts_on_failure=0,
+    )
+
+    result = await attack.execute_async(
+        objective="exfiltrated", expectation=_expectation(matcher=Contains(value="exfiltrated"))
+    )
+
+    assert result.outcome is AttackOutcome.FAILURE
+    score = result.automated_score
+    assert score is not None
+    observations = await sqlite_instance.get_observations_async(observation_ids=score.observation_ids)
+    assert observations
+    assert all(observation.payload.baseline is not None for observation in observations)
+    assert leaf._baselines == {}
+
+
+async def test_failure_to_start_observing_records_the_attempts_error_result_async(
+    *, sqlite_instance: SQLiteMemory, tmp_path: Path
+) -> None:
+    source = LocalFileSurfaceSource(root=tmp_path)
+    scorer = FileWriteScorer(source=source)
+    attempts: list[str] = []
+    start = scorer.start_observing_async
+
+    async def recording_start(*, attempt_id: str, expectation: ScoringExpectation) -> None:
+        attempts.append(attempt_id)
+        await start(attempt_id=attempt_id, expectation=expectation)
+
+    async def failing_baseline(*, scorable: SurfaceScorable) -> SurfaceBaseline:
+        raise OSError("baseline acquisition failed")
+
+    scorer.start_observing_async = recording_start  # type: ignore[method-assign]
+    source.start_observing_async = failing_baseline  # type: ignore[method-assign]
+    attack = PromptSendingAttack(
+        objective_target=_agent_target(root=tmp_path, write=True),
+        attack_scoring_config=AttackScoringConfig(objective_scorer=scorer),
+        max_attempts_on_failure=0,
+    )
+
+    with pytest.raises(Exception, match="baseline acquisition failed"):  # noqa: PT011
+        await attack.execute_async(
+            objective="exfiltrated", expectation=_expectation(matcher=Contains(value="exfiltrated"))
+        )
+
+    (attempt_id,) = attempts
+    (saved,) = await sqlite_instance.get_attack_results_async(attack_result_ids=[attempt_id])
+    assert saved.outcome is AttackOutcome.ERROR
+    assert saved.error_type == "OSError"
+    assert scorer._baselines == {}
+    assert scorer._observing == {}
+
+
+class _StopFailedError(Exception):
+    pass
+
+
+def _failing_stop(scorer: FileWriteScorer) -> None:
+    stop = scorer.stop_observing
+
+    def stop_then_fail(*, attempt_id: str) -> None:
+        stop(attempt_id=attempt_id)
+        raise _StopFailedError("cleanup failed")
+
+    scorer.stop_observing = stop_then_fail  # type: ignore[method-assign]
+
+
+async def test_every_observer_is_stopped_and_the_result_kept_when_one_stop_fails_async(
+    *, sqlite_instance: SQLiteMemory, tmp_path: Path
+) -> None:
+    objective = FileWriteScorer(source=LocalFileSurfaceSource(root=tmp_path))
+    auxiliary = FileWriteScorer(source=LocalFileSurfaceSource(root=tmp_path))
+    _failing_stop(objective)
+    attack = PromptSendingAttack(
+        objective_target=_agent_target(root=tmp_path, write=True),
+        attack_scoring_config=AttackScoringConfig(objective_scorer=objective, auxiliary_scorers=[auxiliary]),
+        max_attempts_on_failure=0,
+    )
+
+    result = await attack.execute_async(
+        objective="exfiltrated", expectation=_expectation(matcher=Contains(value="exfiltrated"))
+    )
+
+    assert result.outcome is AttackOutcome.SUCCESS
+    assert auxiliary._baselines == {}
+    assert auxiliary._observing == {}
+    (saved,) = await sqlite_instance.get_attack_results_async(attack_result_ids=[result.attack_result_id])
+    assert saved.outcome is AttackOutcome.SUCCESS
+
+
+async def test_a_failing_stop_does_not_replace_the_attempts_error_async(tmp_path: Path) -> None:
+    from pyrit.prompt_target import HTTPTarget
+
+    objective = FileWriteScorer(source=LocalFileSurfaceSource(root=tmp_path))
+    auxiliary = FileWriteScorer(source=LocalFileSurfaceSource(root=tmp_path))
+    _failing_stop(objective)
+
+    def refuse(request: httpx.Request) -> httpx.Response:
+        raise httpx.ConnectError("agent unreachable", request=request)
+
+    attack = PromptSendingAttack(
+        objective_target=HTTPTarget(
+            http_request="POST / HTTP/1.1\nHost: agent.test\n\n{PROMPT}", transport=httpx.MockTransport(refuse)
+        ),
+        attack_scoring_config=AttackScoringConfig(objective_scorer=objective, auxiliary_scorers=[auxiliary]),
+        max_attempts_on_failure=0,
+    )
+
+    with pytest.raises(Exception, match="agent unreachable") as raised:  # noqa: PT011
+        await attack.execute_async(
+            objective="exfiltrated", expectation=_expectation(matcher=Contains(value="exfiltrated"))
+        )
+
+    assert not isinstance(raised.value, _StopFailedError)
+    assert auxiliary._baselines == {}
+
+
+def _bytes_target(*, root: Path, data: bytes) -> HTTPTarget:
+    from pyrit.prompt_target import HTTPTarget
+
+    def respond(request: httpx.Request) -> httpx.Response:
+        _write(root=root, data=data)
+        return httpx.Response(200, text="done")
+
+    return HTTPTarget(
+        http_request="POST / HTTP/1.1\nHost: agent.test\n\n{PROMPT}",
+        transport=httpx.MockTransport(respond),
+    )
+
+
+@pytest.mark.parametrize(
+    ("before", "after", "max_content_bytes"),
+    [
+        (b"\xff", b"\xfe", 1_000_000),
+        (b"a" * 64, b"b" * 64, 8),
+    ],
+    ids=["binary", "beyond_content_limit"],
+)
+async def test_changed_content_without_a_matcher_needs_no_decoded_text_async(
+    tmp_path: Path, before: bytes, after: bytes, max_content_bytes: int
+) -> None:
+    _write(root=tmp_path, data=before)
+    attack = PromptSendingAttack(
+        objective_target=_bytes_target(root=tmp_path, data=after),
+        attack_scoring_config=AttackScoringConfig(
+            objective_scorer=FileWriteScorer(
+                source=LocalFileSurfaceSource(root=tmp_path, max_content_bytes=max_content_bytes)
+            )
+        ),
+        max_attempts_on_failure=0,
+    )
+
+    result = await attack.execute_async(objective="write the file", expectation=_expectation())
+
+    assert result.outcome is AttackOutcome.SUCCESS
+    score = result.automated_score
+    assert score is not None
+    assert score.score_rationale.startswith("The attempt wrote nonempty content")
