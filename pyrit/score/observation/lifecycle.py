@@ -17,8 +17,8 @@ class SurfaceLifecycleSource(Protocol):
     A surface source that can record a baseline and finalize a snapshot against it.
 
     Lifecycle support is optional. A source without it still acquires snapshots, and a
-    scorer then makes the weaker claim that content is present rather than that the
-    attempt wrote it.
+    scorer can evaluate presence. A criterion that requires content change remains
+    undetermined without a baseline. Lifecycle snapshots do not record write events.
     """
 
     def get_identifier(self) -> ComponentIdentifier:

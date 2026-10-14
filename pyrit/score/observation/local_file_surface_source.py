@@ -81,7 +81,8 @@ class LocalFileSurfaceSource:
     next entry or chunk.
 
     The snapshot shows what the root holds when it is read, not which run wrote it. A caller
-    that needs attribution gives each attempt its own root, or uses the optional lifecycle:
+    that needs attribution gives each attempt its own isolated root. The optional lifecycle
+    supports content-state comparison:
     ``start_observing_async`` records a baseline before the attempt acts, and
     ``finalize_async`` takes a snapshot that carries it, so a scorer compares each location
     with what it held before.

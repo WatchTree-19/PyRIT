@@ -69,13 +69,13 @@ class SurfaceBaseline(BaseModel):
     """
     What the named locations held when an attempt started.
 
-    A baseline lets a later snapshot say which locations the attempt changed, not only which
-    ones hold content. Entries keep the same bounded evidence a snapshot keeps, so a criterion
+    A baseline lets a later snapshot show differences in observed content, not who wrote it
+    or whether writes occurred between snapshots. Entries keep bounded evidence so a criterion
     can compare what was there before with what is there now. A location the baseline did not
-    cover cannot be attributed to the attempt.
+    cover cannot establish that a later location is new.
 
     ``concurrent`` is set when another attempt observed the same locations while this one ran.
-    A change can then have come from either attempt, so it is not credited to this one.
+    The comparison cannot associate a change with this attempt's window.
     """
 
     model_config = ConfigDict(frozen=True, extra="forbid")

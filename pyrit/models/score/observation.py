@@ -370,7 +370,7 @@ class SurfaceObservationPayload(BaseModel):
     An immutable snapshot of the locations a surface scorable names, as they were when read.
 
     A snapshot finalized against a ``baseline`` carries it, so replay can tell which locations
-    the attempt changed.
+    differ between the observed states. It does not retain write events.
     """
 
     model_config = ConfigDict(frozen=True, extra="forbid")

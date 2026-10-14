@@ -294,10 +294,11 @@ If you are contributing to PyRIT, that work will most likely land in one of the 
   its attempt ID is allocated and before anything is sent, and to stop when the attempt ends. A
   failure to start is recorded as the attempt's error result; a failure to stop is logged and
   does not replace the attempt's outcome or stop the other observers. `FileWriteScorer` then
-  records a baseline through a `SurfaceLifecycleSource` and finalizes the snapshot against it,
-  so it can claim that the attempt wrote the content rather than only that the content is
-  present. A baseline does not separate overlapping attempts, so attempts that share a root
-  still run one at a time. A source without lifecycle support keeps the snapshot behavior.
+  records a baseline through a `SurfaceLifecycleSource` when `ContentWritten.require_content_change`
+  is true. It evaluates whether final content differs from the baseline and matches the criterion.
+  This is state comparison, not write-event detection or writer attribution. Equal snapshots
+  do not prove that no writes occurred. Attempts sharing a root still run one at a time.
+  Presence remains the default; a required comparison without a baseline is undetermined.
 - Raw `ObservationSource` implementations acquire evidence without criteria.
   `ConversationSource` captures whole-conversation references; the conversation scorer owns
   role filtering and rendering. `TargetJudge` is a separate, expectation-bound collaborator:
