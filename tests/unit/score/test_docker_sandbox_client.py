@@ -5,14 +5,18 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
+import os
+import shutil
 import stat
 import sys
 from typing import TYPE_CHECKING
+from unittest.mock import patch
 
 import pytest
 
-from pyrit.models import ProgramInvocation
+from pyrit.models import ProgramExecutionEvent, ProgramInvocation
 from pyrit.score import DockerRuntimeProfile, DockerSandboxClient, SandboxClient, SandboxExecutionError
 
 if TYPE_CHECKING:
@@ -43,13 +47,20 @@ if command == "run":
     program_arg = next(a for a in inner if a.startswith("/program/"))
     program = (Path(source) / program_arg.rsplit("/", 1)[1]).read_text()
     user_args = inner[inner.index(program_arg) + 1:]
+    flags = {"rm_fails": program == "RMFAIL", "slow_inspect": program == "SLOWINSPECT"}
+    def save(**info):
+        path(name, "state").write_text(json.dumps({**flags, **info}))
     def finish(code, oom=False, started=True):
-        path(name, "state").write_text(json.dumps(
-            {"code": code, "oom": oom, "started": "2026-10-14T00:00:00Z" if started else "0001-01-01T00:00:00Z"}))
+        save(status="exited" if started else "created", code=code, oom=oom,
+             started="2026-10-14T00:00:00Z" if started else "0001-01-01T00:00:00Z")
         sys.stdout.flush()
         sys.exit(code)
     path(name, "pid").write_text(str(os.getpid()))
-    path(name, "state").write_text(json.dumps({"code": 0, "oom": False, "started": "2026-10-14T00:00:00Z"}))
+    save(status="running", code=0, oom=False, started="2026-10-14T00:00:00Z")
+    if program == "DETACHFAIL":
+        # The attached client fails while the container keeps running.
+        sys.stderr.write("error waiting for container: unexpected EOF")
+        sys.exit(1)
     if program == "ECHO":
         data = sys.stdin.read()
         print(" ".join(user_args))
@@ -83,16 +94,27 @@ elif command == "inspect":
     except FileNotFoundError:
         print("Error: No such object: " + name)
         sys.exit(1)
-    print(info["code"], "true" if info["oom"] else "false", info["started"])
+    if info.get("slow_inspect"):
+        (state / "inspect.pid").write_text(str(os.getpid()))
+        time.sleep(60)
+    print(info["status"], info["code"], "true" if info["oom"] else "false", info["started"])
 elif command == "kill":
     name = args[-1]
     pid = int(path(name, "pid").read_text())
     os.kill(pid, signal.SIGKILL)
     info = json.loads(path(name, "state").read_text())
     info["code"] = 137
+    info["status"] = "exited"
     path(name, "state").write_text(json.dumps(info))
 elif command == "rm":
     name = args[-1]
+    try:
+        info = json.loads(path(name, "state").read_text())
+    except FileNotFoundError:
+        info = {}
+    if info.get("rm_fails"):
+        print("Error response from daemon: daemon unavailable")
+        sys.exit(1)
     with (state / "removed.log").open("a") as log:
         log.write(name + "\n")
     path(name, "state").unlink(missing_ok=True)
@@ -266,3 +288,78 @@ def test_client_satisfies_the_sandbox_protocol(tmp_path: Path) -> None:
     params = client.get_identifier().params
     assert params["profiles"]["python-3.12"]["image"] == _IMAGE
     assert params["timeout_seconds"] == 5.0
+
+
+async def test_a_client_failure_while_the_container_runs_is_a_sandbox_error_async(fake_docker: Path) -> None:
+    with pytest.raises(SandboxExecutionError, match="still running"):
+        await _run(_client(fake_docker), "DETACHFAIL")
+    assert len(_removed(fake_docker)) == 1
+
+
+async def test_a_failed_removal_is_reported_and_stops_further_cases_async(fake_docker: Path) -> None:
+    run = await _run(_client(fake_docker), "RMFAIL", ProgramInvocation(), ProgramInvocation())
+
+    assert [event.case_index for event in run.events] == [0]
+    assert run.events[0].exit_code == 0
+    assert "could not remove container pyrit-sandbox-" in run.warnings[0]
+    assert "daemon unavailable" in run.warnings[0]
+    assert run.reasons[0].startswith("stopped after case 0")
+
+
+async def test_a_failed_removal_on_the_last_case_keeps_the_evidence_async(fake_docker: Path) -> None:
+    run = await _run(_client(fake_docker), "RMFAIL")
+
+    assert len(run.events) == 1
+    assert run.reasons == ()
+    assert len(run.warnings) == 1
+
+
+async def test_cancellation_reaps_the_management_command_async(fake_docker: Path) -> None:
+    pid_file = fake_docker.parent / "state" / "inspect.pid"
+    task = asyncio.create_task(_run(_client(fake_docker), "SLOWINSPECT"))
+    for _ in range(200):
+        if pid_file.exists():
+            break
+        await asyncio.sleep(0.05)
+    inspect_pid = int(pid_file.read_text())
+
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    with pytest.raises(ProcessLookupError):
+        os.kill(inspect_pid, 0)
+
+
+async def test_the_program_directory_is_removed_after_making_it_writable_async(tmp_path: Path) -> None:
+    client = _client(tmp_path / "docker")
+    seen: dict[str, object] = {}
+    real_rmtree = shutil.rmtree
+
+    async def run_invocation(**kwargs: object):  # type: ignore[no-untyped-def]
+        program_dir = kwargs["program_dir"]
+        seen["dir"] = program_dir
+        event = ProgramExecutionEvent(
+            case_index=kwargs["case_index"],
+            runtime_profile="python-3.12",
+            runtime_image_digest="sha256:" + "c" * 64,
+            resolved_command=("python3",),
+            exit_code=0,
+            duration_ms=1,
+        )
+        return event, None
+
+    def recording_rmtree(path, *args, **kwargs):  # type: ignore[no-untyped-def]
+        program = next(iter(path.iterdir()))
+        seen["writable"] = bool(program.stat().st_mode & stat.S_IWRITE)
+        return real_rmtree(path, *args, **kwargs)
+
+    with (
+        patch.object(client, "_run_invocation_async", side_effect=run_invocation),
+        patch("pyrit.score.observation.docker_sandbox_client.shutil.rmtree", side_effect=recording_rmtree),
+    ):
+        run = await _run(client, "print(1)")
+
+    assert len(run.events) == 1
+    assert seen["writable"] is True
+    assert not seen["dir"].exists()  # type: ignore[union-attr]

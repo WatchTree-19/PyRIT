@@ -180,8 +180,8 @@ class ProgramExecutionScorable(Scorable):
     One isolated execution attempt of a program: the program, its runtime, and its invocations.
 
     This is an acquisition request, not a result: it holds no expected output, so the source
-    that runs it cannot see which output passes. ``program`` names the code to run, either a
-    stored message with one text piece or loose text, and is used verbatim; code is never
+    that runs it cannot see which output passes. ``program`` names the code to run: a stored
+    message with one text piece, loose text, or stored loose text. It is used verbatim; code is never
     extracted from surrounding prose.
 
     ``execution_id`` identifies the attempt. Reusing a scorable reuses one observed execution,
@@ -190,7 +190,7 @@ class ProgramExecutionScorable(Scorable):
 
     scorable_type: Literal["program_execution"] = "program_execution"
     execution_id: uuid.UUID
-    program: Annotated[MessageScorable | ContentScorable, Field(discriminator="scorable_type")]
+    program: Annotated[MessageScorable | ContentScorable | ContentEntryScorable, Field(discriminator="scorable_type")]
     runtime_profile: RuntimeProfileName
     invocations: tuple[ProgramInvocation, ...]
 
@@ -205,7 +205,7 @@ class ProgramExecutionScorable(Scorable):
         Raises:
             ValueError: If the program is not text, or there is nothing to run.
         """
-        if isinstance(self.program, ContentScorable) and self.program.data_type != "text":
+        if isinstance(self.program, (ContentScorable, ContentEntryScorable)) and self.program.data_type != "text":
             raise ValueError("A program must be text content.")
         if not self.invocations:
             raise ValueError("A ProgramExecutionScorable requires at least one invocation.")

@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import uuid
 from typing import TYPE_CHECKING
@@ -13,6 +14,7 @@ from pyrit.models import (
     Acquisition,
     ComponentIdentifier,
     Contains,
+    ContentEntryScorable,
     ContentScorable,
     ContentWritten,
     Equals,
@@ -558,3 +560,111 @@ def test_observation_round_trip_keeps_the_program_reference() -> None:
         payload=ProgramExecutionObservationPayload(program_sha256="a" * 64, events=(_event(),)),
     )
     assert Observation.model_validate(observation.model_dump(mode="json")) == observation
+
+
+class _SlowSandbox(_FakeSandbox):
+    """Holds each run open until released, so concurrent callers overlap."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.release = asyncio.Event()
+
+    async def execute_async(self, *, program, runtime_profile, invocations):  # type: ignore[no-untyped-def]
+        self.calls.append((program, runtime_profile, invocations))
+        await self.release.wait()
+        return SandboxRun(events=tuple(_event(case_index=index) for index in range(len(invocations))))
+
+
+def _attempt() -> ProgramExecutionScorable:
+    return ProgramExecutionScorable(
+        execution_id=uuid.uuid4(),
+        program=ContentScorable(value="x"),
+        runtime_profile=_PROFILE,
+        invocations=(ProgramInvocation(),),
+    )
+
+
+async def test_concurrent_callers_share_one_run_of_an_attempt_async() -> None:
+    sandbox = _SlowSandbox()
+    source = ProgramExecutionSource(sandbox=sandbox)
+    execution = _attempt()
+
+    pending = asyncio.gather(source.acquire_async(scorable=execution), source.acquire_async(scorable=execution))
+    await asyncio.sleep(0)
+    sandbox.release.set()
+    first, second = await pending
+
+    assert len(sandbox.calls) == 1
+    assert first.id == second.id
+
+
+async def test_one_cancelled_caller_does_not_cancel_the_shared_run_async() -> None:
+    sandbox = _SlowSandbox()
+    source = ProgramExecutionSource(sandbox=sandbox)
+    execution = _attempt()
+
+    cancelled = asyncio.create_task(source.acquire_async(scorable=execution))
+    kept = asyncio.create_task(source.acquire_async(scorable=execution))
+    await asyncio.sleep(0)
+    cancelled.cancel()
+    await asyncio.sleep(0)
+    sandbox.release.set()
+
+    observation = await kept
+    with pytest.raises(asyncio.CancelledError):
+        await cancelled
+    assert observation.acquisition is Acquisition.COMPLETE
+    assert len(sandbox.calls) == 1
+
+
+async def test_a_run_nobody_waits_for_is_cancelled_async() -> None:
+    sandbox = _SlowSandbox()
+    source = ProgramExecutionSource(sandbox=sandbox)
+    execution = _attempt()
+
+    task = asyncio.create_task(source.acquire_async(scorable=execution))
+    await asyncio.sleep(0)
+    flight = source._in_flight[execution]
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    await asyncio.sleep(0)
+
+    assert flight.task.cancelled()
+    assert execution not in source._in_flight
+
+
+async def test_sandbox_warnings_are_kept_on_the_observation_async(sqlite_instance: SQLiteMemory) -> None:
+    class _LeakySandbox(_FakeSandbox):
+        async def execute_async(self, *, program, runtime_profile, invocations):  # type: ignore[no-untyped-def]
+            return SandboxRun(
+                events=(_event(),), warnings=("could not remove container pyrit-sandbox-1: daemon unavailable",)
+            )
+
+    score = (
+        await _scorer(_LeakySandbox()).score_async(
+            scorable=ContentScorable(value="x"), expectation=_expectation(_case("1"))
+        )
+    )[0]
+
+    observation = (await sqlite_instance.get_observations_async(observation_ids=score.observation_ids))[0]
+    assert score.score_value == "true"
+    assert observation.acquisition is Acquisition.COMPLETE
+    assert "daemon unavailable" in observation.metadata["sandbox_warnings"]
+
+
+async def test_scoring_a_saved_score_anchor_runs_the_stored_program_async(sqlite_instance: SQLiteMemory) -> None:
+    sandbox = _FakeSandbox(outputs={"3": {"stdout": "9"}, "4": {"stdout": "16"}})
+    scorer = _scorer(sandbox)
+    program = ContentScorable(value="import sys\nprint(int(sys.argv[1]) ** 2)\n")
+    first = (await scorer.score_async(scorable=program, expectation=_expectation(*_SQUARES)))[0]
+    saved = (await sqlite_instance.get_scores_async(score_ids=[first.id]))[0]
+    assert isinstance(saved.scorable, ContentEntryScorable)
+
+    again = (await scorer.score_async(scorable=saved.scorable, expectation=_expectation(*_SQUARES)))[0]
+
+    assert again.score_value == "true"
+    assert [call[0] for call in sandbox.calls] == [program.value, program.value]
+    observation = (await sqlite_instance.get_observations_async(observation_ids=again.observation_ids))[0]
+    assert isinstance(observation.scorable, ProgramExecutionScorable)
+    assert observation.scorable.program == saved.scorable

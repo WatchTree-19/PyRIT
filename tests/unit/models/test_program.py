@@ -12,6 +12,7 @@ from pyrit.models import (
     Acquisition,
     ComponentIdentifier,
     Condition,
+    ContentEntryScorable,
     ContentScorable,
     Equals,
     MessageScorable,
@@ -138,6 +139,23 @@ def test_execution_scorable_round_trips_as_a_stored_scorable() -> None:
     )
     for scorable in (message_program, _execution()):
         assert scorable_from_dict(scorable.model_dump(mode="json")) == scorable
+
+
+def test_execution_scorable_accepts_stored_text_content() -> None:
+    stored = ProgramExecutionScorable(
+        execution_id=uuid.uuid4(),
+        program=ContentEntryScorable(content_id=uuid.uuid4()),
+        runtime_profile="python-3.12",
+        invocations=(ProgramInvocation(),),
+    )
+    assert scorable_from_dict(stored.model_dump(mode="json")) == stored
+    with pytest.raises(ValidationError, match="text"):
+        ProgramExecutionScorable(
+            execution_id=uuid.uuid4(),
+            program=ContentEntryScorable(content_id=uuid.uuid4(), data_type="image_path"),
+            runtime_profile="python-3.12",
+            invocations=(ProgramInvocation(),),
+        )
 
 
 def test_execution_scorable_requires_text_and_an_invocation() -> None:

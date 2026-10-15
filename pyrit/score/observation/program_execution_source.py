@@ -5,9 +5,11 @@
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import logging
 from collections import OrderedDict
+from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
 from pyrit.memory import CentralMemory
@@ -34,6 +36,14 @@ class _NoProgramError(Exception):
     """The named evidence holds nothing that can be submitted as a program."""
 
 
+@dataclass
+class _InFlight:
+    """One running acquisition and how many callers are waiting for it."""
+
+    task: asyncio.Future[Observation]
+    waiters: int = 0
+
+
 class ProgramExecutionSource:
     """
     Run the program a ``ProgramExecutionScorable`` names, once per invocation, in a sandbox.
@@ -54,8 +64,11 @@ class ProgramExecutionSource:
     program that failed its tests.
 
     Each stream keeps at most ``max_output_chars`` characters and records when it was cut.
-    A completed or partial observation is reused when the same scorable is acquired again, so
-    one execution attempt is observed once; a new ``execution_id`` runs the program again.
+    A completed or partial observation is reused when the same scorable is acquired again, and
+    concurrent callers for one attempt share a single run, so one execution attempt is observed
+    once; a new ``execution_id`` runs the program again. Problems the sandbox reports after the
+    evidence was collected, such as a container it could not remove, are kept in the
+    observation's ``sandbox_warnings`` metadata.
     """
 
     _MAX_REUSED_OBSERVATIONS = 256
@@ -76,6 +89,7 @@ class ProgramExecutionSource:
         self._sandbox = sandbox
         self._max_output_chars = max_output_chars
         self._observed: OrderedDict[ProgramExecutionScorable, Observation] = OrderedDict()
+        self._in_flight: dict[ProgramExecutionScorable, _InFlight] = {}
 
     def get_identifier(self) -> ComponentIdentifier:
         """
@@ -109,6 +123,31 @@ class ProgramExecutionSource:
         if reused is not None:
             self._observed.move_to_end(scorable)
             return reused
+        flight = self._in_flight.get(scorable)
+        if flight is None:
+            flight = _InFlight(task=asyncio.ensure_future(self._acquire_uncached_async(scorable=scorable)))
+            self._in_flight[scorable] = flight
+            flight.task.add_done_callback(lambda _task, key=scorable: self._in_flight.pop(key, None))
+        flight.waiters += 1
+        try:
+            return await asyncio.shield(flight.task)
+        finally:
+            flight.waiters -= 1
+            if flight.waiters == 0 and not flight.task.done():
+                # Every caller of this attempt was cancelled, so nobody needs its result.
+                flight.task.cancel()
+
+    async def _acquire_uncached_async(self, *, scorable: ProgramExecutionScorable) -> Observation:
+        """
+        Run the attempt once; ``acquire_async`` shares this work between concurrent callers.
+
+        Returns:
+            Observation: The execution evidence, with its acquisition state.
+
+        Raises:
+            ValueError: If the runtime profile is not offered, the program reference is
+                unusable, or the sandbox returns events for invocations it was not given.
+        """
         if scorable.runtime_profile not in self._sandbox.get_runtime_profiles():
             raise ValueError(
                 f"Runtime profile {scorable.runtime_profile!r} is not offered by the sandbox; "
@@ -147,6 +186,8 @@ class ProgramExecutionSource:
                 program_sha256=program_sha256 if events else None,
                 reasons=reasons,
             )
+        if run.warnings:
+            observation = observation.model_copy(update={"metadata": {"sandbox_warnings": "; ".join(run.warnings)}})
         if observation.acquisition in (Acquisition.COMPLETE, Acquisition.PARTIAL):
             self._remember(scorable=scorable, observation=observation)
         return observation
@@ -160,12 +201,13 @@ class ProgramExecutionSource:
 
         Raises:
             _NoProgramError: If the named message holds a blocked or failed response.
-            ValueError: If the reference cannot be resolved to one text piece.
+            ValueError: If the reference cannot be resolved to one text piece, or stored
+                content is missing.
         """
         reference = scorable.program
         if isinstance(reference, ContentScorable):
             return reference.value
-        if not isinstance(reference, MessageScorable) or len(reference.message_piece_ids) != 1:
+        if isinstance(reference, MessageScorable) and len(reference.message_piece_ids) != 1:
             raise ValueError("A program message reference must name exactly one message piece.")
         message = await MessageScorableResolver().resolve_async(
             scorable=reference, memory=CentralMemory.get_memory_instance()

@@ -29,11 +29,13 @@ class SandboxRun:
 
     ``events`` holds one event for each invocation that ran, in case order. When the sandbox
     stopped before running every invocation, ``reasons`` says why, so the missing cases stay
-    undetermined instead of failing.
+    undetermined instead of failing. ``warnings`` reports problems that do not invalidate the
+    evidence collected, such as an environment the sandbox could not destroy afterwards.
     """
 
     events: tuple[ProgramExecutionEvent, ...] = ()
     reasons: tuple[str, ...] = ()
+    warnings: tuple[str, ...] = ()
 
 
 @runtime_checkable

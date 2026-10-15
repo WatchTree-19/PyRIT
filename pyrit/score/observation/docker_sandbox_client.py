@@ -11,6 +11,7 @@ import logging
 import os
 import re
 import shutil
+import stat
 import tempfile
 import time
 import uuid
@@ -199,30 +200,48 @@ class DockerSandboxClient:
         if profile is None:
             raise ValueError(f"Runtime profile {runtime_profile!r} is not configured.")
         program_dir = Path(tempfile.mkdtemp(prefix="pyrit-program-"))
+        program_path = program_dir / profile.program_filename
         try:
-            program_path = program_dir / profile.program_filename
             program_path.write_text(program, encoding="utf-8")
             program_path.chmod(0o444)
             program_dir.chmod(0o755)
             events: list[ProgramExecutionEvent] = []
             for index, invocation in enumerate(invocations):
                 try:
-                    events.append(
-                        await self._run_invocation_async(
-                            case_index=index,
-                            runtime_profile=runtime_profile,
-                            profile=profile,
-                            program_dir=program_dir,
-                            invocation=invocation,
-                        )
+                    event, cleanup_warning = await self._run_invocation_async(
+                        case_index=index,
+                        runtime_profile=runtime_profile,
+                        profile=profile,
+                        program_dir=program_dir,
+                        invocation=invocation,
                     )
                 except SandboxExecutionError as error:
                     if not events:
                         raise
                     return SandboxRun(events=tuple(events), reasons=(f"sandbox error at case {index}: {error}",))
+                events.append(event)
+                if cleanup_warning is not None:
+                    # The environment may still be running, so no further case starts beside it.
+                    remaining = len(invocations) - len(events)
+                    reasons = (f"stopped after case {index}: {cleanup_warning}",) if remaining else ()
+                    return SandboxRun(events=tuple(events), reasons=reasons, warnings=(cleanup_warning,))
             return SandboxRun(events=tuple(events))
         finally:
-            shutil.rmtree(program_dir, ignore_errors=True)
+            self._remove_program_dir(program_dir=program_dir, program_path=program_path)
+
+    @staticmethod
+    def _remove_program_dir(*, program_dir: Path, program_path: Path) -> None:
+        """
+        Delete the submitted program, restoring write permission first.
+
+        On Windows the read-only mode is a file attribute that blocks deletion, so the file
+        is made writable again before the directory is removed.
+        """
+        with contextlib.suppress(OSError):
+            program_path.chmod(stat.S_IREAD | stat.S_IWRITE)
+        shutil.rmtree(program_dir, ignore_errors=True)
+        if program_dir.exists():
+            logger.warning("Could not remove the program directory %s", program_dir)
 
     async def _run_invocation_async(
         self,
@@ -232,15 +251,17 @@ class DockerSandboxClient:
         profile: DockerRuntimeProfile,
         program_dir: Path,
         invocation: ProgramInvocation,
-    ) -> ProgramExecutionEvent:
+    ) -> tuple[ProgramExecutionEvent, str | None]:
         """
         Run one invocation in a new container and remove the container afterwards.
 
         Returns:
-            ProgramExecutionEvent: What the invocation did.
+            tuple[ProgramExecutionEvent, str | None]: What the invocation did, and a warning when
+            the container could not be removed.
 
         Raises:
-            SandboxExecutionError: If Docker cannot start or inspect the container.
+            SandboxExecutionError: If Docker cannot start or inspect the container, or the
+                container had not finished when the attached client exited.
         """
         name = f"pyrit-sandbox-{uuid.uuid4().hex}"
         resolved_command = (*profile.command, f"/program/{profile.program_filename}", *invocation.arguments)
@@ -289,6 +310,7 @@ class DockerSandboxClient:
         except OSError as error:
             raise SandboxExecutionError(f"could not start {self._docker!r}: {error}") from error
         timed_out = False
+        cleanup_warning: str | None = None
         try:
             readers = asyncio.gather(
                 self._read_capped_async(process.stdout),
@@ -311,14 +333,18 @@ class DockerSandboxClient:
                 (stdout, stdout_truncated), (stderr, stderr_truncated), _ = await readers
             await process.wait()
             duration_ms = int((time.monotonic() - started) * 1000)
-            container = await self._inspect_async(name=name, cli_stderr=stderr)
+            container = await self._inspect_async(name=name, cli_stderr=stderr, timed_out=timed_out)
         finally:
             if process.returncode is None:
                 with contextlib.suppress(ProcessLookupError):
                     process.kill()
                 await process.wait()
-            await self._control_async("rm", "--force", name)
-        return ProgramExecutionEvent(
+            removal_status, removal_output = await self._control_async("rm", "--force", name)
+            if removal_status != 0:
+                detail = removal_output.strip()[:300] or "unknown Docker failure"
+                cleanup_warning = f"could not remove container {name}: {detail}"
+                logger.warning("Sandbox cleanup failed: %s", cleanup_warning)
+        event = ProgramExecutionEvent(
             case_index=case_index,
             runtime_profile=runtime_profile,
             runtime_image_digest=profile.image_digest,
@@ -332,26 +358,40 @@ class DockerSandboxClient:
             resource_limit_exceeded=container.oom_killed and not timed_out,
             duration_ms=duration_ms,
         )
+        return event, cleanup_warning
 
-    async def _inspect_async(self, *, name: str, cli_stderr: bytes) -> _ContainerExit:
+    async def _inspect_async(self, *, name: str, cli_stderr: bytes, timed_out: bool) -> _ContainerExit:
         """
         Read how the container ended, distinguishing a program exit from a Docker failure.
+
+        An exit code is only reported for a container that has finished. A container still
+        running when the attached client exited means the run was cut short by Docker, not by
+        the program, unless the sandbox stopped it at its time limit.
 
         Returns:
             _ContainerExit: The container's exit code and whether the kernel killed it for memory.
 
         Raises:
-            SandboxExecutionError: If the container does not exist or never started.
+            SandboxExecutionError: If the container does not exist, never started, or had not
+                finished when the client exited.
         """
         returncode, output = await self._control_async(
-            "inspect", "--format", "{{.State.ExitCode}} {{.State.OOMKilled}} {{.State.StartedAt}}", name
+            "inspect",
+            "--format",
+            "{{.State.Status}} {{.State.ExitCode}} {{.State.OOMKilled}} {{.State.StartedAt}}",
+            name,
         )
         fields = output.split()
-        if returncode != 0 or len(fields) != 3 or fields[2] == _NEVER_STARTED:
+        if returncode != 0 or len(fields) != 4 or fields[3] == _NEVER_STARTED:
             lines = [line.strip() for line in cli_stderr.decode("utf-8", errors="replace").splitlines() if line.strip()]
             detail = lines[0][:500] if lines else output.strip()[:500]
             raise SandboxExecutionError(f"the container did not start: {detail or 'unknown Docker failure'}")
-        return _ContainerExit(exit_code=int(fields[0]), oom_killed=fields[1] == "true")
+        status = fields[0]
+        if status != "exited" and not timed_out:
+            raise SandboxExecutionError(
+                f"the Docker client exited while the container was still {status}, so the program did not finish"
+            )
+        return _ContainerExit(exit_code=int(fields[1]), oom_killed=fields[2] == "true")
 
     async def _control_async(self, *arguments: str) -> tuple[int, str]:
         """
@@ -374,11 +414,14 @@ class DockerSandboxClient:
         try:
             output, _ = await asyncio.wait_for(process.communicate(), timeout=self._CONTROL_TIMEOUT_SECONDS)
         except TimeoutError:
-            with contextlib.suppress(ProcessLookupError):
-                process.kill()
-            await process.wait()
             logger.warning("Docker %s timed out", arguments[0])
             return -1, "timed out"
+        finally:
+            # Runs on timeout and on cancellation alike, so no management command outlives its caller.
+            if process.returncode is None:
+                with contextlib.suppress(ProcessLookupError):
+                    process.kill()
+                await process.wait()
         return process.returncode if process.returncode is not None else -1, output.decode("utf-8", errors="replace")
 
     async def _read_capped_async(self, stream: asyncio.StreamReader | None) -> tuple[bytes, bool]:

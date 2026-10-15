@@ -11,6 +11,7 @@ from typing import TYPE_CHECKING
 from pyrit.models import (
     Acquisition,
     Contains,
+    ContentEntryScorable,
     ContentScorable,
     MessageScorable,
     ProgramBehaves,
@@ -123,8 +124,8 @@ class ProgramExecutionScorer(TrueFalseScorer):
     runtime profile and the invocations, and sends only that to its source. Each expected result
     stays with the scorer, so the code that runs the program never learns which output passes.
 
-    The program is the scored content, run verbatim: loose text, or a stored message with one
-    text piece. Code is not extracted from surrounding prose, so a response that wraps code in
+    The program is the scored content, run verbatim: loose text, stored loose text, or a stored
+    message with one text piece. Code is not extracted from surrounding prose, so a response that wraps code in
     explanation fails its cases rather than being guessed at.
 
     The verdict is true when every case passes and false when any case fails. A compile error,
@@ -164,7 +165,7 @@ class ProgramExecutionScorer(TrueFalseScorer):
                     "ProgramBehaves condition."
                 )
             execution = scorable
-        elif isinstance(scorable, (MessageScorable, ContentScorable)):
+        elif isinstance(scorable, (MessageScorable, ContentScorable, ContentEntryScorable)):
             execution = ProgramExecutionScorable(
                 execution_id=uuid.uuid4(),
                 program=scorable,
@@ -173,7 +174,8 @@ class ProgramExecutionScorer(TrueFalseScorer):
             )
         else:
             raise TypeError(
-                "ProgramExecutionScorer requires a MessageScorable, a ContentScorable, or a ProgramExecutionScorable."
+                "ProgramExecutionScorer requires a MessageScorable, a ContentScorable, a ContentEntryScorable, "
+                "or a ProgramExecutionScorable."
             )
 
         observation = await self._source.acquire_async(scorable=execution)
