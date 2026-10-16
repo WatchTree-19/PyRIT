@@ -134,8 +134,13 @@ class ProgramExecutionSource:
         finally:
             flight.waiters -= 1
             if flight.waiters == 0 and not flight.task.done():
-                # Every caller of this attempt was cancelled, so nobody needs its result.
+                # Every caller of this attempt was cancelled, so nobody needs its result. Wait for
+                # the sandbox's cleanup before the caller's cancellation completes, so that
+                # cancelling still means the environment is gone.
                 flight.task.cancel()
+                await asyncio.wait({flight.task})
+                if not flight.task.cancelled() and flight.task.exception() is not None:
+                    logger.debug("Cancelled execution %s ended with %r", scorable.execution_id, flight.task.exception())
 
     async def _acquire_uncached_async(self, *, scorable: ProgramExecutionScorable) -> Observation:
         """

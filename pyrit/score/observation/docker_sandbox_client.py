@@ -89,7 +89,9 @@ class DockerSandboxClient:
 
     A container that runs past ``timeout_seconds`` is killed and reported as timed out. One that
     the kernel stops for exceeding its memory limit is reported as exceeding a resource limit.
-    Each stream keeps at most ``max_output_bytes`` bytes. The timeout includes container start-up.
+    Each stream keeps at most ``max_output_bytes`` bytes. The timeout includes container start-up
+    and the attached client's exit; a client still running once its streams have closed is
+    ended at the deadline, and the container's own state then decides the result.
 
     This client isolates submitted code with Docker's defaults plus the restrictions above. It
     is not a hardened multi-tenant sandbox; run it on a host dedicated to evaluation.
@@ -311,6 +313,9 @@ class DockerSandboxClient:
             raise SandboxExecutionError(f"could not start {self._docker!r}: {error}") from error
         timed_out = False
         cleanup_warning: str | None = None
+        # One wall-clock deadline covers the whole invocation: reading the output and the
+        # attached client's exit.
+        deadline = started + self._timeout_seconds
         try:
             readers = asyncio.gather(
                 self._read_capped_async(process.stdout),
@@ -331,7 +336,17 @@ class DockerSandboxClient:
                     with contextlib.suppress(ProcessLookupError):
                         process.kill()
                 (stdout, stdout_truncated), (stderr, stderr_truncated), _ = await readers
-            await process.wait()
+            try:
+                exit_budget = self._CONTROL_TIMEOUT_SECONDS if timed_out else max(deadline - time.monotonic(), 0.0)
+                await asyncio.wait_for(process.wait(), timeout=exit_budget)
+            except TimeoutError:
+                # The streams closed but the attached client did not exit in time. Ending the
+                # client keeps the invocation bounded; the container's own state, read below,
+                # decides whether the program finished, so a stalled client is not mistaken
+                # for a program that ran too long.
+                with contextlib.suppress(ProcessLookupError):
+                    process.kill()
+                await process.wait()
             duration_ms = int((time.monotonic() - started) * 1000)
             container = await self._inspect_async(name=name, cli_stderr=stderr, timed_out=timed_out)
         finally:

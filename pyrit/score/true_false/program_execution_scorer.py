@@ -183,31 +183,14 @@ class ProgramExecutionScorer(TrueFalseScorer):
             raise ValueError("Program execution source changed the caller's evidence anchor.")
         if not isinstance(observation.payload, ProgramExecutionObservationPayload):
             raise ValueError("Program execution source returned incompatible evidence.")
-        # A reused attempt's evidence may already be stored; a new score then only links to it.
-        if execution is not scorable or not await self._is_stored_async(observation=observation):
-            _collect_observation(observation)
+        # A reused or shared attempt's evidence may already be stored. Memory links an identical
+        # stored observation instead of inserting it again, atomically under its row lock.
+        _collect_observation(observation)
         scores = self._score_observation(observation=observation, evidence=observation.payload, expectation=expectation)
         for score in scores:
             score.scorable = scorable
             score.message_piece_id = self._piece_id_from_scorable(scorable)
         return scores
-
-    async def _is_stored_async(self, *, observation: Observation) -> bool:
-        """
-        Check whether an observation the source reused is already stored unchanged.
-
-        Returns:
-            bool: True when memory holds the same observation.
-
-        Raises:
-            ValueError: If memory holds a different observation under the same id.
-        """
-        stored = await self._memory.get_observations_async(observation_ids=[observation.id])
-        if not stored:
-            return False
-        if stored[0] != observation:
-            raise ValueError(f"Observation {observation.id} does not match its stored evidence.")
-        return True
 
     def _score_observation(
         self,

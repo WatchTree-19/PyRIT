@@ -57,6 +57,18 @@ if command == "run":
         sys.exit(code)
     path(name, "pid").write_text(str(os.getpid()))
     save(status="running", code=0, oom=False, started="2026-10-14T00:00:00Z")
+    if program in ("CLOSEHANG", "CLOSEHANGRUNNING"):
+        # The client closes its output streams but does not exit. With CLOSEHANG the
+        # container has finished; with CLOSEHANGRUNNING it is still running.
+        print("done")
+        sys.stdout.flush()
+        if program == "CLOSEHANG":
+            save(status="exited", code=0, oom=False, started="2026-10-14T00:00:00Z")
+        for fd in (1, 2):
+            os.close(fd)
+        (state / "hang.pid").write_text(str(os.getpid()))
+        time.sleep(60)
+        sys.exit(0)
     if program == "DETACHFAIL":
         # The attached client fails while the container keeps running.
         sys.stderr.write("error waiting for container: unexpected EOF")
@@ -213,6 +225,33 @@ async def test_timeout_kills_the_container_async(fake_docker: Path) -> None:
     assert event.timed_out
     assert event.exit_code is None
     assert not event.resource_limit_exceeded
+    assert len(_removed(fake_docker)) == 1
+
+
+def _alive(pid_file: Path) -> bool:
+    try:
+        os.kill(int(pid_file.read_text()), 0)
+    except ProcessLookupError:
+        return False
+    return True
+
+
+async def test_a_client_that_closes_its_streams_but_never_exits_is_bounded_async(fake_docker: Path) -> None:
+    # The container finished, so its exit is real evidence even though the client hung.
+    run = await asyncio.wait_for(_run(_client(fake_docker, timeout_seconds=1.0), "CLOSEHANG"), timeout=10)
+
+    event = run.events[0]
+    assert (event.exit_code, event.stdout, event.timed_out) == (0, "done\n", False)
+    assert not _alive(fake_docker.parent / "state" / "hang.pid")
+    assert len(_removed(fake_docker)) == 1
+
+
+async def test_a_hung_client_over_a_running_container_is_a_bounded_sandbox_error_async(fake_docker: Path) -> None:
+    # The container never finished, so the result is a sandbox error, not a program timeout.
+    with pytest.raises(SandboxExecutionError, match="still running"):
+        await asyncio.wait_for(_run(_client(fake_docker, timeout_seconds=1.0), "CLOSEHANGRUNNING"), timeout=10)
+
+    assert not _alive(fake_docker.parent / "state" / "hang.pid")
     assert len(_removed(fake_docker)) == 1
 
 

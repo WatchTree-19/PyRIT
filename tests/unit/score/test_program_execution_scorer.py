@@ -634,6 +634,85 @@ async def test_a_run_nobody_waits_for_is_cancelled_async() -> None:
     assert execution not in source._in_flight
 
 
+class _SlowCleanupSandbox(_SlowSandbox):
+    """Holds its cleanup open after cancellation until released."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.cleanup_started = asyncio.Event()
+        self.cleanup_release = asyncio.Event()
+        self.cleaned_up = False
+
+    async def execute_async(self, *, program, runtime_profile, invocations):  # type: ignore[no-untyped-def]
+        try:
+            return await super().execute_async(
+                program=program, runtime_profile=runtime_profile, invocations=invocations
+            )
+        except asyncio.CancelledError:
+            self.cleanup_started.set()
+            await self.cleanup_release.wait()
+            self.cleaned_up = True
+            raise
+
+
+async def test_cancelling_the_last_caller_waits_for_sandbox_cleanup_async() -> None:
+    sandbox = _SlowCleanupSandbox()
+    source = ProgramExecutionSource(sandbox=sandbox)
+    execution = _attempt()
+
+    task = asyncio.create_task(source.acquire_async(scorable=execution))
+    await asyncio.sleep(0)
+    task.cancel()
+    await asyncio.wait_for(sandbox.cleanup_started.wait(), timeout=5)
+    for _ in range(5):
+        await asyncio.sleep(0)
+    assert not task.done(), "cancellation finished before the sandbox cleaned up"
+
+    sandbox.cleanup_release.set()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert sandbox.cleaned_up
+    assert execution not in source._in_flight
+
+
+async def test_concurrent_scoring_of_one_attempt_stores_its_observation_once_async(
+    sqlite_instance: SQLiteMemory,
+) -> None:
+    sandbox = _SlowSandbox()
+    scorer = ProgramExecutionScorer(source=ProgramExecutionSource(sandbox=sandbox))
+    execution = _attempt()
+    expectation = _expectation(ProgramCase(invocation=ProgramInvocation()))
+    # Hold both callers at the write until each has done every read, so neither sees the
+    # other's observation already stored.
+    arrived, both_arrived = 0, asyncio.Event()
+    write = sqlite_instance.add_scores_to_memory_async
+
+    async def write_together(**kwargs):  # type: ignore[no-untyped-def]
+        nonlocal arrived
+        arrived += 1
+        if arrived == 2:
+            both_arrived.set()
+        await asyncio.wait_for(both_arrived.wait(), timeout=5)
+        return await write(**kwargs)
+
+    sqlite_instance.add_scores_to_memory_async = write_together  # type: ignore[method-assign]
+
+    pending = asyncio.gather(
+        scorer.score_async(scorable=execution, expectation=expectation),
+        scorer.score_async(scorable=execution, expectation=expectation),
+    )
+    await asyncio.sleep(0)
+    sandbox.release.set()
+    first, second = await pending
+
+    assert len(sandbox.calls) == 1
+    assert first[0].score_value == second[0].score_value == "true"
+    assert first[0].observation_ids == second[0].observation_ids
+    stored = await sqlite_instance.get_scores_async(score_ids=[first[0].id, second[0].id])
+    assert len(stored) == 2
+    assert len(await sqlite_instance.get_observations_async(observation_ids=first[0].observation_ids)) == 1
+
+
 async def test_sandbox_warnings_are_kept_on_the_observation_async(sqlite_instance: SQLiteMemory) -> None:
     class _LeakySandbox(_FakeSandbox):
         async def execute_async(self, *, program, runtime_profile, invocations):  # type: ignore[no-untyped-def]
