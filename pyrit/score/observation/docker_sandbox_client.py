@@ -17,13 +17,13 @@ import time
 import uuid
 from dataclasses import dataclass
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, ParamSpec, TypeVar
 
 from pyrit.models import ComponentIdentifier, ProgramExecutionEvent
 from pyrit.score.observation.sandbox_client import SandboxExecutionError, SandboxRun
 
 if TYPE_CHECKING:
-    from collections.abc import Mapping
+    from collections.abc import Callable, Mapping
 
     from pyrit.models import ProgramInvocation
 
@@ -31,6 +31,32 @@ logger = logging.getLogger(__name__)
 
 _DIGEST_PATTERN = re.compile(r"@(sha256:[0-9a-f]{64})$")
 _NEVER_STARTED = "0001-01-01T00:00:00Z"
+
+_P = ParamSpec("_P")
+_T = TypeVar("_T")
+
+
+async def _complete_in_thread(function: Callable[_P, _T], /, *args: _P.args, **kwargs: _P.kwargs) -> _T:
+    """
+    Run blocking file work in a worker thread, letting it finish if the caller is cancelled.
+
+    A thread cannot be interrupted, so a cancelled caller waits for the work to end before its
+    cancellation completes. Cleanup that follows then sees the file system the work left.
+
+    Returns:
+        _T: What the function returned.
+
+    Raises:
+        CancelledError: Once the work has ended, if the caller was cancelled.
+    """
+    work = asyncio.ensure_future(asyncio.to_thread(function, *args, **kwargs))
+    try:
+        return await asyncio.shield(work)
+    except asyncio.CancelledError:
+        await asyncio.wait({work})
+        if not work.cancelled() and work.exception() is not None:
+            logger.debug("File work ended with %r after its caller was cancelled", work.exception())
+        raise
 
 
 @dataclass(frozen=True)
@@ -74,6 +100,15 @@ class _ContainerExit:
     oom_killed: bool
 
 
+@dataclass(frozen=True)
+class _ClientOutput:
+    stdout: bytes
+    stdout_truncated: bool
+    stderr: bytes
+    stderr_truncated: bool
+    timed_out: bool
+
+
 class DockerSandboxClient:
     """
     Run each invocation in its own disposable Docker container.
@@ -82,7 +117,9 @@ class DockerSandboxClient:
     no privilege escalation, an unprivileged user, and caps on memory, CPU, and process count.
     The program is mounted read-only; a small ``/tmp`` is the only writable location. Each
     invocation gets a fresh container that is removed afterwards, so one run cannot leave state
-    for the next.
+    for the next. Docker keeps no log of the container's output, so output volume never grows
+    the daemon's files, and the profile's command replaces the image's entrypoint, so the
+    recorded command is the one that runs.
 
     Images are never pulled while scoring: a profile's image must already be present, or the
     attempt fails as a sandbox error. Pull the pinned images before a run.
@@ -142,6 +179,7 @@ class DockerSandboxClient:
         self._cpus = cpus
         self._pids_limit = pids_limit
         self._max_output_bytes = max_output_bytes
+        self._temp_root = Path(tempfile.gettempdir())
 
     def get_identifier(self) -> ComponentIdentifier:
         """
@@ -201,12 +239,12 @@ class DockerSandboxClient:
         profile = self._profiles.get(runtime_profile)
         if profile is None:
             raise ValueError(f"Runtime profile {runtime_profile!r} is not configured.")
-        program_dir = Path(tempfile.mkdtemp(prefix="pyrit-program-"))
+        program_dir = self._temp_root / f"pyrit-program-{uuid.uuid4().hex}"
         program_path = program_dir / profile.program_filename
         try:
-            program_path.write_text(program, encoding="utf-8")
-            program_path.chmod(0o444)
-            program_dir.chmod(0o755)
+            await _complete_in_thread(
+                self._write_program, program_dir=program_dir, program_path=program_path, program=program
+            )
             events: list[ProgramExecutionEvent] = []
             for index, invocation in enumerate(invocations):
                 try:
@@ -229,7 +267,15 @@ class DockerSandboxClient:
                     return SandboxRun(events=tuple(events), reasons=reasons, warnings=(cleanup_warning,))
             return SandboxRun(events=tuple(events))
         finally:
-            self._remove_program_dir(program_dir=program_dir, program_path=program_path)
+            await _complete_in_thread(self._remove_program_dir, program_dir=program_dir, program_path=program_path)
+
+    @staticmethod
+    def _write_program(*, program_dir: Path, program_path: Path, program: str) -> None:
+        """Create a private directory and write the program into it, then make both read-only for others."""
+        program_dir.mkdir(mode=0o700)
+        program_path.write_text(program, encoding="utf-8")
+        program_path.chmod(0o444)
+        program_dir.chmod(0o755)
 
     @staticmethod
     def _remove_program_dir(*, program_dir: Path, program_path: Path) -> None:
@@ -267,7 +313,67 @@ class DockerSandboxClient:
         """
         name = f"pyrit-sandbox-{uuid.uuid4().hex}"
         resolved_command = (*profile.command, f"/program/{profile.program_filename}", *invocation.arguments)
-        argv = [
+        argv = self._run_arguments(
+            name=name, profile=profile, program_dir=program_dir, resolved_command=resolved_command
+        )
+        started = time.monotonic()
+        try:
+            process = await asyncio.create_subprocess_exec(
+                *argv,
+                stdin=asyncio.subprocess.PIPE,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+        except OSError as error:
+            raise SandboxExecutionError(f"could not start {self._docker!r}: {error}") from error
+        cleanup_warning: str | None = None
+        try:
+            output = await self._collect_output_async(
+                process=process, name=name, stdin=invocation.stdin, deadline=started + self._timeout_seconds
+            )
+            duration_ms = int((time.monotonic() - started) * 1000)
+            container = await self._inspect_async(name=name, cli_stderr=output.stderr, timed_out=output.timed_out)
+        finally:
+            if process.returncode is None:
+                with contextlib.suppress(ProcessLookupError):
+                    process.kill()
+                await process.wait()
+            removal_status, removal_output = await self._control_async("rm", "--force", name)
+            if removal_status != 0:
+                detail = removal_output.strip()[:300] or "unknown Docker failure"
+                cleanup_warning = f"could not remove container {name}: {detail}"
+                logger.warning("Sandbox cleanup failed: %s", cleanup_warning)
+        timed_out = output.timed_out
+        event = ProgramExecutionEvent(
+            case_index=case_index,
+            runtime_profile=runtime_profile,
+            runtime_image_digest=profile.image_digest,
+            resolved_command=resolved_command,
+            exit_code=None if (timed_out or container.oom_killed) else container.exit_code,
+            stdout=output.stdout.decode("utf-8", errors="replace"),
+            stderr=output.stderr.decode("utf-8", errors="replace"),
+            stdout_truncated=output.stdout_truncated,
+            stderr_truncated=output.stderr_truncated,
+            timed_out=timed_out,
+            resource_limit_exceeded=container.oom_killed and not timed_out,
+            duration_ms=duration_ms,
+        )
+        return event, cleanup_warning
+
+    def _run_arguments(
+        self, *, name: str, profile: DockerRuntimeProfile, program_dir: Path, resolved_command: tuple[str, ...]
+    ) -> list[str]:
+        """
+        Build the ``docker run`` command line for one invocation.
+
+        The profile's first argument becomes the entrypoint, so an image's own entrypoint
+        never runs in front of ``resolved_command``. Daemon-side logging is off: the attached
+        client reads the output, and nothing is kept on the host beyond what it retains.
+
+        Returns:
+            list[str]: The arguments, starting with the Docker client.
+        """
+        return [
             self._docker,
             "run",
             "--name",
@@ -275,6 +381,8 @@ class DockerSandboxClient:
             "--interactive",
             "--pull",
             "never",
+            "--log-driver",
+            "none",
             "--network",
             "none",
             "--read-only",
@@ -298,82 +406,60 @@ class DockerSandboxClient:
             "/tmp",
             "--mount",
             f"type=bind,source={os.fspath(program_dir)},target=/program,readonly",
+            "--entrypoint",
+            resolved_command[0],
             profile.image,
-            *resolved_command,
+            *resolved_command[1:],
         ]
-        started = time.monotonic()
-        try:
-            process = await asyncio.create_subprocess_exec(
-                *argv,
-                stdin=asyncio.subprocess.PIPE,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-            )
-        except OSError as error:
-            raise SandboxExecutionError(f"could not start {self._docker!r}: {error}") from error
+
+    async def _collect_output_async(
+        self, *, process: asyncio.subprocess.Process, name: str, stdin: str | None, deadline: float
+    ) -> _ClientOutput:
+        """
+        Feed the input, read both streams, and wait for the attached client to exit, by one deadline.
+
+        A container still running at the deadline is killed and the run is marked timed out. A
+        client whose streams closed but that has not exited by the deadline is ended; the
+        container's own state, inspected afterwards, then decides whether the program finished,
+        so a stalled client is not mistaken for a program that ran too long.
+
+        Returns:
+            _ClientOutput: The retained output and whether the run timed out.
+        """
+        readers = asyncio.gather(
+            self._read_capped_async(process.stdout),
+            self._read_capped_async(process.stderr),
+            self._feed_stdin_async(process.stdin, stdin),
+        )
         timed_out = False
-        cleanup_warning: str | None = None
-        # One wall-clock deadline covers the whole invocation: reading the output and the
-        # attached client's exit.
-        deadline = started + self._timeout_seconds
         try:
-            readers = asyncio.gather(
-                self._read_capped_async(process.stdout),
-                self._read_capped_async(process.stderr),
-                self._feed_stdin_async(process.stdin, invocation.stdin),
+            (stdout, stdout_truncated), (stderr, stderr_truncated), _ = await asyncio.wait_for(
+                asyncio.shield(readers), timeout=max(deadline - time.monotonic(), 0.0)
             )
+        except TimeoutError:
+            timed_out = True
+            await self._control_async("kill", name)
             try:
-                (stdout, stdout_truncated), (stderr, stderr_truncated), _ = await asyncio.wait_for(
-                    asyncio.shield(readers), timeout=self._timeout_seconds
-                )
+                await asyncio.wait_for(asyncio.shield(readers), timeout=self._CONTROL_TIMEOUT_SECONDS)
             except TimeoutError:
-                timed_out = True
-                await self._control_async("kill", name)
-                try:
-                    await asyncio.wait_for(asyncio.shield(readers), timeout=self._CONTROL_TIMEOUT_SECONDS)
-                except TimeoutError:
-                    # The container would not stop; ending the attached client closes its streams.
-                    with contextlib.suppress(ProcessLookupError):
-                        process.kill()
-                (stdout, stdout_truncated), (stderr, stderr_truncated), _ = await readers
-            try:
-                exit_budget = self._CONTROL_TIMEOUT_SECONDS if timed_out else max(deadline - time.monotonic(), 0.0)
-                await asyncio.wait_for(process.wait(), timeout=exit_budget)
-            except TimeoutError:
-                # The streams closed but the attached client did not exit in time. Ending the
-                # client keeps the invocation bounded; the container's own state, read below,
-                # decides whether the program finished, so a stalled client is not mistaken
-                # for a program that ran too long.
+                # The container would not stop; ending the attached client closes its streams.
                 with contextlib.suppress(ProcessLookupError):
                     process.kill()
-                await process.wait()
-            duration_ms = int((time.monotonic() - started) * 1000)
-            container = await self._inspect_async(name=name, cli_stderr=stderr, timed_out=timed_out)
-        finally:
-            if process.returncode is None:
-                with contextlib.suppress(ProcessLookupError):
-                    process.kill()
-                await process.wait()
-            removal_status, removal_output = await self._control_async("rm", "--force", name)
-            if removal_status != 0:
-                detail = removal_output.strip()[:300] or "unknown Docker failure"
-                cleanup_warning = f"could not remove container {name}: {detail}"
-                logger.warning("Sandbox cleanup failed: %s", cleanup_warning)
-        event = ProgramExecutionEvent(
-            case_index=case_index,
-            runtime_profile=runtime_profile,
-            runtime_image_digest=profile.image_digest,
-            resolved_command=resolved_command,
-            exit_code=None if (timed_out or container.oom_killed) else container.exit_code,
-            stdout=stdout.decode("utf-8", errors="replace"),
-            stderr=stderr.decode("utf-8", errors="replace"),
+            (stdout, stdout_truncated), (stderr, stderr_truncated), _ = await readers
+        try:
+            exit_budget = self._CONTROL_TIMEOUT_SECONDS if timed_out else max(deadline - time.monotonic(), 0.0)
+            await asyncio.wait_for(process.wait(), timeout=exit_budget)
+        except TimeoutError:
+            with contextlib.suppress(ProcessLookupError):
+                process.kill()
+            await process.wait()
+        return _ClientOutput(
+            stdout=stdout,
             stdout_truncated=stdout_truncated,
+            stderr=stderr,
             stderr_truncated=stderr_truncated,
             timed_out=timed_out,
-            resource_limit_exceeded=container.oom_killed and not timed_out,
-            duration_ms=duration_ms,
         )
-        return event, cleanup_warning
 
     async def _inspect_async(self, *, name: str, cli_stderr: bytes, timed_out: bool) -> _ContainerExit:
         """

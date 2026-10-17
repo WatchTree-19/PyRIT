@@ -661,7 +661,12 @@ async def test_cancelling_the_last_caller_waits_for_sandbox_cleanup_async() -> N
     execution = _attempt()
 
     task = asyncio.create_task(source.acquire_async(scorable=execution))
-    await asyncio.sleep(0)
+    # The source checks memory before it runs the program, so wait for the run itself to start.
+    for _ in range(500):
+        if sandbox.calls:
+            break
+        await asyncio.sleep(0.01)
+    assert sandbox.calls
     task.cancel()
     await asyncio.wait_for(sandbox.cleanup_started.wait(), timeout=5)
     for _ in range(5):
@@ -747,3 +752,82 @@ async def test_scoring_a_saved_score_anchor_runs_the_stored_program_async(sqlite
     observation = (await sqlite_instance.get_observations_async(observation_ids=again.observation_ids))[0]
     assert isinstance(observation.scorable, ProgramExecutionScorable)
     assert observation.scorable.program == saved.scorable
+
+
+class _ChangingSandbox(_FakeSandbox):
+    """Prints something different on every run, so a second run of one attempt would show."""
+
+    async def execute_async(self, *, program, runtime_profile, invocations):  # type: ignore[no-untyped-def]
+        self.calls.append((program, runtime_profile, invocations))
+        stdout = "9" if len(self.calls) == 1 else f"run {len(self.calls)}"
+        return SandboxRun(events=tuple(_event(case_index=index, stdout=stdout) for index in range(len(invocations))))
+
+
+async def test_a_stored_attempt_is_reused_after_the_source_evicts_it_async(sqlite_instance: SQLiteMemory) -> None:
+    sandbox = _ChangingSandbox()
+    source = ProgramExecutionSource(sandbox=sandbox)
+    scorer = ProgramExecutionScorer(source=source)
+    expectation = _expectation(_case("3", stdout=Equals(value="9")))
+    execution = ProgramExecutionScorable(
+        execution_id=uuid.uuid4(),
+        program=ContentScorable(value="x"),
+        runtime_profile=_PROFILE,
+        invocations=(ProgramInvocation(arguments=("3",)),),
+    )
+
+    first = (await scorer.score_async(scorable=execution, expectation=expectation))[0]
+    for _ in range(ProgramExecutionSource._MAX_REUSED_OBSERVATIONS):
+        await source.acquire_async(scorable=_attempt())
+    assert execution not in source._observed
+    again = (await scorer.score_async(scorable=execution, expectation=expectation))[0]
+
+    runs_of_execution = [call for call in sandbox.calls if call[2] == execution.invocations]
+    assert len(runs_of_execution) == 1
+    assert (first.score_value, again.score_value) == ("true", "true")
+    assert first.observation_ids == again.observation_ids
+    stored = await sqlite_instance.get_scores_async(score_ids=[first.id, again.id])
+    assert len(stored) == 2
+    assert len(await sqlite_instance.get_observations_async(observation_ids=first.observation_ids)) == 1
+
+
+async def test_errors_are_retried_as_new_observations_not_the_attempts_evidence_async() -> None:
+    sandbox = _FakeSandbox()
+    source = ProgramExecutionSource(sandbox=sandbox)
+    execution = _attempt()
+    sandbox.error = SandboxExecutionError("no daemon")
+
+    failed = await source.acquire_async(scorable=execution)
+    sandbox.error = None
+    ran = await source.acquire_async(scorable=execution)
+
+    assert failed.acquisition is Acquisition.ERROR
+    assert ran.acquisition is Acquisition.COMPLETE
+    assert failed.id != ran.id
+    assert ran.id == ProgramExecutionSource(sandbox=sandbox)._attempt_observation_id(execution)
+
+
+async def test_two_sources_cannot_store_two_runs_of_one_attempt_async(sqlite_instance: SQLiteMemory) -> None:
+    first_sandbox, second_sandbox = _SlowSandbox(), _SlowSandbox()
+    scorers = [_scorer(first_sandbox), _scorer(second_sandbox)]
+    execution = _attempt()
+    expectation = _expectation(ProgramCase(invocation=ProgramInvocation(), expected=ProgramResult()))
+
+    pending = asyncio.gather(
+        *(scorer.score_async(scorable=execution, expectation=expectation) for scorer in scorers),
+        return_exceptions=True,
+    )
+    for _ in range(500):
+        if first_sandbox.calls and second_sandbox.calls:
+            break
+        await asyncio.sleep(0.01)
+    first_sandbox.release.set()
+    second_sandbox.release.set()
+    results = await pending
+
+    # Each source ran the attempt, so the later store is refused rather than keeping a second run.
+    errors = [result for result in results if isinstance(result, BaseException)]
+    stored = [result for result in results if not isinstance(result, BaseException)]
+    assert len(errors) == 1
+    assert "already exist" in str(errors[0])
+    assert len(stored) == 1
+    assert len(await sqlite_instance.get_observations_async(observation_ids=stored[0][0].observation_ids)) == 1

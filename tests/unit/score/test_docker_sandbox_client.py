@@ -8,9 +8,12 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import pathlib
 import shutil
 import stat
 import sys
+import tempfile
+import threading
 from typing import TYPE_CHECKING
 from unittest.mock import patch
 
@@ -44,6 +47,11 @@ if command == "run":
     source = dict(part.split("=", 1) for part in mount.split(",") if "=" in part)["source"]
     image_index = next(i for i, a in enumerate(args) if "@sha256:" in a)
     inner = args[image_index + 1:]
+    # Docker runs the image's entrypoint before the command, unless --entrypoint replaces it.
+    entrypoint = os.environ.get("FAKE_IMAGE_ENTRYPOINT")
+    if "--entrypoint" in args:
+        entrypoint = args[args.index("--entrypoint") + 1]
+    path(name, "effective").write_text(json.dumps(([entrypoint] if entrypoint else []) + inner))
     program_arg = next(a for a in inner if a.startswith("/program/"))
     program = (Path(source) / program_arg.rsplit("/", 1)[1]).read_text()
     user_args = inner[inner.index(program_arg) + 1:]
@@ -201,14 +209,31 @@ async def test_containers_are_locked_down_and_removed_async(fake_docker: Path) -
         ("--memory-swap", "128m"),
         ("--cpus", "0.5"),
         ("--pids-limit", "8"),
+        ("--log-driver", "none"),
     ]:
         assert argv[argv.index(flag) + 1] == value
     assert "--read-only" in argv
     assert "--privileged" not in argv
+    assert "--log-opt" not in argv
     mount = argv[argv.index("--mount") + 1]
     assert mount.endswith(",target=/program,readonly")
-    assert argv[argv.index(_IMAGE) + 1 :] == ["python3", "-I", "/program/main.py"]
+    # The profile's first argument is the entrypoint, so the image's own entrypoint never runs.
+    assert argv[argv.index("--entrypoint") + 1] == "python3"
+    assert argv.index("--entrypoint") < argv.index(_IMAGE)
+    assert argv[argv.index(_IMAGE) + 1 :] == ["-I", "/program/main.py"]
     assert _removed(fake_docker) == [argv_files[0].stem]
+
+
+async def test_an_image_entrypoint_does_not_change_the_command_that_runs_async(
+    fake_docker: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("FAKE_IMAGE_ENTRYPOINT", "python3")
+
+    run = await _run(_client(fake_docker), "ECHO", ProgramInvocation(arguments=("x",)))
+
+    effective = json.loads(next((fake_docker.parent / "state").glob("*.effective")).read_text())
+    assert tuple(effective) == run.events[0].resolved_command == ("python3", "-I", "/program/main.py", "x")
+    assert run.events[0].exit_code == 0
 
 
 async def test_program_exit_codes_are_observed_not_errors_async(fake_docker: Path) -> None:
@@ -402,3 +427,92 @@ async def test_the_program_directory_is_removed_after_making_it_writable_async(t
     assert len(run.events) == 1
     assert seen["writable"] is True
     assert not seen["dir"].exists()  # type: ignore[union-attr]
+
+
+async def _fake_run_invocation(**kwargs: object) -> tuple[ProgramExecutionEvent, None]:
+    event = ProgramExecutionEvent(
+        case_index=kwargs["case_index"],  # type: ignore[arg-type]
+        runtime_profile="python-3.12",
+        runtime_image_digest="sha256:" + "c" * 64,
+        resolved_command=("python3",),
+        exit_code=0,
+        duration_ms=1,
+    )
+    return event, None
+
+
+@pytest.mark.parametrize("blocked", ["write", "remove"])
+async def test_file_work_runs_off_the_event_loop_async(blocked: str, tmp_path: Path) -> None:
+    client = _client(tmp_path / "docker")
+    release = threading.Event()
+    threads: list[int] = []
+    real_write_text = pathlib.Path.write_text
+    real_rmtree = shutil.rmtree
+
+    def wait_for_the_loop() -> None:
+        # Only the running event loop releases this, so file work on the loop thread deadlocks here.
+        threads.append(threading.get_ident())
+        if not release.wait(2):
+            raise AssertionError("the event loop was blocked while file work ran")
+
+    def blocking_write_text(self: pathlib.Path, *args: object, **kwargs: object) -> int:
+        if blocked == "write":
+            wait_for_the_loop()
+        return real_write_text(self, *args, **kwargs)  # type: ignore[arg-type]
+
+    def blocking_rmtree(path: pathlib.Path, *args: object, **kwargs: object) -> None:
+        if blocked == "remove":
+            wait_for_the_loop()
+        real_rmtree(path, *args, **kwargs)  # type: ignore[arg-type]
+
+    async def release_once_blocked() -> None:
+        while not threads:
+            await asyncio.sleep(0.005)
+        release.set()
+
+    with (
+        patch.object(client, "_run_invocation_async", side_effect=_fake_run_invocation),
+        patch.object(pathlib.Path, "write_text", blocking_write_text),
+        patch("pyrit.score.observation.docker_sandbox_client.shutil.rmtree", side_effect=blocking_rmtree),
+    ):
+        releaser = asyncio.create_task(release_once_blocked())
+        run = await _run(client, "print(1)")
+        await asyncio.wait_for(releaser, timeout=1)
+
+    assert len(run.events) == 1
+    assert threads[0] != threading.get_ident()
+
+
+async def test_cancelling_during_file_work_still_removes_the_program_async(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = tmp_path / "temp"
+    root.mkdir()
+    monkeypatch.setattr(tempfile, "tempdir", str(root))
+    client = _client(tmp_path / "docker")
+    real_mkdir = pathlib.Path.mkdir
+    entered = threading.Event()
+    release = threading.Event()
+
+    def gated_mkdir(self: pathlib.Path, *args: object, **kwargs: object) -> None:
+        entered.set()
+        release.wait(5)
+        real_mkdir(self, *args, **kwargs)  # type: ignore[arg-type]
+
+    with (
+        patch.object(client, "_run_invocation_async", side_effect=_fake_run_invocation),
+        patch.object(pathlib.Path, "mkdir", gated_mkdir),
+    ):
+        task = asyncio.create_task(_run(client, "print(1)"))
+        for _ in range(200):
+            if entered.is_set():
+                break
+            await asyncio.sleep(0.01)
+        assert entered.is_set()
+        task.cancel()
+        asyncio.get_running_loop().call_later(0.2, release.set)
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        # The cancellation completed only after the program directory had been made and removed.
+        assert release.is_set()
+        assert list(root.iterdir()) == []

@@ -8,6 +8,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import logging
+import uuid
 from collections import OrderedDict
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
@@ -30,6 +31,10 @@ if TYPE_CHECKING:
     from pyrit.score.observation.sandbox_client import SandboxClient
 
 logger = logging.getLogger(__name__)
+
+# Namespace for the IDs of reusable execution evidence, derived from the source and the attempt.
+_OBSERVATION_NAMESPACE = uuid.UUID("20acb8a7-a3ed-5df1-b292-83d20448a0fd")
+_REUSABLE = (Acquisition.COMPLETE, Acquisition.PARTIAL)
 
 
 class _NoProgramError(Exception):
@@ -66,9 +71,17 @@ class ProgramExecutionSource:
     Each stream keeps at most ``max_output_chars`` characters and records when it was cut.
     A completed or partial observation is reused when the same scorable is acquired again, and
     concurrent callers for one attempt share a single run, so one execution attempt is observed
-    once; a new ``execution_id`` runs the program again. Problems the sandbox reports after the
-    evidence was collected, such as a container it could not remove, are kept in the
-    observation's ``sandbox_warnings`` metadata.
+    once; a new ``execution_id`` runs the program again. The source holds recent observations,
+    and its evidence for an attempt always has the same ID, derived from the source
+    configuration and the attempt. Once memory stores that observation, as scoring does, a
+    later acquisition loads it instead of running the program, however many attempts the
+    source has seen since; every stored score therefore judges the attempt's one stored run.
+    Evidence that was never stored and has left the cache runs again under the same ID, and
+    memory refuses a second, different run of an attempt that already has stored evidence,
+    so contradicting results are never stored for one attempt. Acquisition reads memory, so
+    the central memory instance must be set.
+    Problems the sandbox reports after the evidence was collected, such as a container it
+    could not remove, are kept in the observation's ``sandbox_warnings`` metadata.
     """
 
     _MAX_REUSED_OBSERVATIONS = 256
@@ -158,6 +171,12 @@ class ProgramExecutionSource:
                 f"Runtime profile {scorable.runtime_profile!r} is not offered by the sandbox; "
                 f"available profiles: {sorted(self._sandbox.get_runtime_profiles())}."
             )
+        stored = await CentralMemory.get_memory_instance().get_observations_async(
+            observation_ids=[self._attempt_observation_id(scorable)]
+        )
+        if stored:
+            self._remember(scorable=scorable, observation=stored[0])
+            return stored[0]
         try:
             program = await self._resolve_program_async(scorable=scorable)
         except _NoProgramError as error:
@@ -252,7 +271,10 @@ class ProgramExecutionSource:
         program_sha256: str | None = None,
         reasons: tuple[str, ...] = (),
     ) -> Observation:
+        # Only reusable evidence takes the attempt's ID; an error is retried as a new observation.
+        observation_id = self._attempt_observation_id(scorable) if acquisition in _REUSABLE else uuid.uuid4()
         return Observation(
+            id=observation_id,
             source_identifier=self.get_identifier(),
             acquisition=acquisition,
             scorable=scorable,
@@ -262,6 +284,15 @@ class ProgramExecutionSource:
                 reasons=reasons,
             ),
         )
+
+    def _attempt_observation_id(self, scorable: ProgramExecutionScorable) -> uuid.UUID:
+        """
+        Derive the ID of an attempt's reusable evidence from the source configuration and the attempt.
+
+        Returns:
+            uuid.UUID: The same ID for the same source configuration and attempt.
+        """
+        return uuid.uuid5(_OBSERVATION_NAMESPACE, f"{self.get_identifier().hash}:{scorable.model_dump_json()}")
 
     def _remember(self, *, scorable: ProgramExecutionScorable, observation: Observation) -> None:
         self._observed[scorable] = observation
