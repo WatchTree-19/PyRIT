@@ -4,11 +4,14 @@
 from __future__ import annotations
 
 import dataclasses
+import importlib
+from pathlib import Path
 from typing import Literal, cast
 from unittest.mock import MagicMock
 
 import pytest
 
+import pyrit.score
 from pyrit.models import (
     ComponentIdentifier,
     Condition,
@@ -24,11 +27,14 @@ from pyrit.models import (
 from pyrit.score import (
     LegacyScorerHookError,
     ManualScorer,
+    MessageScorer,
     MessageTrueFalseScorer,
+    Scorer,
     ScorerCapabilities,
     ScorerPromptValidator,
     SelfAskGeneralFloatScaleScorer,
     SelfAskScaleScorer,
+    SubStringScorer,
     TrueFalseInverterScorer,
     TrueFalseScorer,
 )
@@ -246,8 +252,6 @@ class TestLegacyHookConstruction:
         assert _TypedMessageScorer().capabilities.condition_type is _TypedCondition
 
     def test_direct_scorer_with_typed_legacy_hook_fails_at_class_definition(self) -> None:
-        from pyrit.score import Scorer
-
         with pytest.raises(LegacyScorerHookError, match="Implement _score_scorable_async"):
 
             class TypedDirectScorer(Scorer):
@@ -257,8 +261,6 @@ class TestLegacyHookConstruction:
                     return []
 
     def test_subclass_of_adapted_legacy_scorer_cannot_add_typed_condition(self) -> None:
-        from pyrit.score import Scorer
-
         class LegacyDirectScorer(Scorer):
             async def _score_async(self, message: Message, *, objective: str | None = None) -> list[Score]:
                 return []
@@ -285,3 +287,58 @@ class TestModalityPreflight:
         scorer = _TypedMessageScorer(validator=ScorerPromptValidator(supported_data_types=["image_path"]))
         with pytest.raises(ValueError, match=r"supports 'text' data type\. Supported types: \['image_path'\]"):
             AudioTranscriptHelper._validate_text_scorer(scorer)
+
+
+def _in_repo_scorer_classes() -> list[type[Scorer]]:
+    root = Path(pyrit.score.__file__).parent
+    for path in sorted(root.rglob("*.py")):
+        module = ".".join(("pyrit", "score", *path.relative_to(root).with_suffix("").parts))
+        try:
+            importlib.import_module(module.removesuffix(".__init__"))
+        except ImportError:
+            continue  # optional extras, such as torch-backed scorers
+    pending: list[type[Scorer]] = [Scorer]
+    found: list[type[Scorer]] = []
+    while pending:
+        cls = pending.pop()
+        pending.extend(cls.__subclasses__())
+        if cls.__module__.startswith("pyrit.") and cls not in found:
+            found.append(cls)
+    return found
+
+
+class TestInRepoScorersUseTypedHook:
+    def test_no_in_repo_scorer_defines_the_legacy_piece_hook(self) -> None:
+        legacy = [
+            cls.__qualname__
+            for cls in _in_repo_scorer_classes()
+            if cls is not MessageScorer and "_score_piece_async" in cls.__dict__
+        ]
+
+        assert legacy == []
+
+    def test_external_subclass_of_migrated_scorer_must_move_its_override(self) -> None:
+        class CustomSubstringScorer(SubStringScorer):
+            async def _score_piece_async(
+                self, message_piece: MessagePiece, *, objective: str | None = None
+            ) -> list[Score]:
+                raise AssertionError("must not be silently skipped")
+
+        with pytest.raises(
+            LegacyScorerHookError, match="Move the custom policy to _score_piece_with_expectation_async"
+        ):
+            CustomSubstringScorer(substring="x")
+
+    async def test_legacy_call_on_migrated_scorer_names_the_typed_hook_async(self) -> None:
+        piece = MessagePiece(role="assistant", original_value="a word")
+        with pytest.raises(NotImplementedError, match=r"Call _score_piece_with_expectation_async\(message_piece"):
+            await SubStringScorer(substring="word")._score_piece_async(piece)
+
+    async def test_migrated_scorer_still_records_objective_async(self) -> None:
+        expectation = ScoringExpectation(objective="find the word")
+        [score] = await SubStringScorer(substring="word").score_async(
+            scorable=ContentScorable(value="a word"), expectation=expectation
+        )
+
+        assert score.get_value() is True
+        assert score.objective == "find the word"

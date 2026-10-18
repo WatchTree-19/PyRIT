@@ -1409,8 +1409,15 @@ class MessageScorer(Scorer):
         typed criteria.
 
         Raises:
-            NotImplementedError: If the leaf implements neither piece hook.
+            NotImplementedError: If the leaf implements neither piece hook, or only the typed one.
         """
+        mro = type(self).__mro__
+        own_bases = mro[: mro.index(MessageScorer)] if MessageScorer in mro else ()
+        if any("_score_piece_with_expectation_async" in cls.__dict__ for cls in own_bases):
+            raise NotImplementedError(
+                f"{type(self).__name__} implements _score_piece_with_expectation_async, not the objective-only "
+                "_score_piece_async. Call _score_piece_with_expectation_async(message_piece, expectation=...)."
+            )
         raise NotImplementedError(f"{type(self).__name__} implements no piece scoring hook.")
 
     def _build_scoring_message(self, *, message: Message) -> Message | None:

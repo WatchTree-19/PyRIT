@@ -47,6 +47,9 @@ Requirements:
 - A legacy `_score_piece_async` override below a typed scorer raises `LegacyScorerHookError` (a
   `TypeError`) at construction. Keep this fail-fast check: implicit dispatch through both hooks can
   skip or repeat custom policy.
+- In-repo message leaves implement `_score_piece_with_expectation_async`. The objective-only
+  `_score_piece_async` hook remains only so external scorers keep working until 2.0; do not add
+  new in-repo uses of it.
 - A leaf that declares a typed `CONDITION_TYPE` other than `MatchesObjective` must implement an
   expectation-aware hook. If only a legacy objective-only hook can receive the criterion,
   construction raises `LegacyScorerHookError`. Legacy hooks support objective-based scoring until 2.0.
