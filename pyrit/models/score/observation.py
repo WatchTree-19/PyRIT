@@ -12,11 +12,11 @@ from typing import TYPE_CHECKING, Annotated, Any, Literal
 
 from pydantic import AwareDatetime, BaseModel, ConfigDict, Field, field_validator, model_validator
 
+from pyrit.models.code_execution import _ProgramExecutionEvent  # noqa: TC001 (runtime-required by Pydantic)
 from pyrit.models.identifiers.component_identifier import (
     ComponentIdentifier,  # noqa: TC001  (runtime-required by Pydantic field annotations)
 )
 from pyrit.models.literals import MEDIA_PATH_DATA_TYPES
-from pyrit.models.score.program import ProgramExecutionEvent  # noqa: TC001 (runtime-required by Pydantic)
 from pyrit.models.score.scorable import (
     ContentEntryScorable,
     ContentScorable,
@@ -436,7 +436,7 @@ class ProgramExecutionObservationPayload(BaseModel):
     kind: Literal["program_execution"] = "program_execution"
     schema_version: Literal[1] = 1
     program_sha256: str | None = Field(default=None, min_length=64, max_length=64, pattern=r"^[0-9a-f]{64}$")
-    events: tuple[ProgramExecutionEvent, ...] = ()
+    events: tuple[_ProgramExecutionEvent, ...] = ()
     reasons: tuple[str, ...] = ()
 
     @field_validator("schema_version", mode="before")
@@ -458,32 +458,20 @@ class ProgramExecutionObservationPayload(BaseModel):
     @model_validator(mode="after")
     def _validate_events(self) -> ProgramExecutionObservationPayload:
         """
-        Keep one event per case, in case order.
+        Keep one event per invocation, in invocation order.
 
         Returns:
             ProgramExecutionObservationPayload: The validated payload.
 
         Raises:
-            ValueError: If a case repeats, events are out of order, or events lack a program digest.
+            ValueError: If an invocation repeats, events are out of order, or events lack a program digest.
         """
-        indices = [event.case_index for event in self.events]
+        indices = [event.invocation_index for event in self.events]
         if indices != sorted(set(indices)):
-            raise ValueError("Program execution events must name each case once, in case order.")
+            raise ValueError("Program execution events must name each invocation once, in invocation order.")
         if self.events and self.program_sha256 is None:
             raise ValueError("Program execution events require the digest of the program that ran.")
         return self
-
-    def event_for(self, case_index: int) -> ProgramExecutionEvent | None:
-        """
-        Return the event for one case.
-
-        Args:
-            case_index (int): The case's position in the condition.
-
-        Returns:
-            ProgramExecutionEvent | None: The event, or None when that case did not run.
-        """
-        return next((event for event in self.events if event.case_index == case_index), None)
 
 
 ObservationPayload = Annotated[
@@ -612,9 +600,9 @@ class Observation(BaseModel):
         if not isinstance(self.scorable, ProgramExecutionScorable):
             raise ValueError("Program execution observations require a ProgramExecutionScorable.")
         events = self.payload.events
-        if any(event.case_index >= len(self.scorable.invocations) for event in events):
+        if any(event.invocation_index >= len(self.scorable.invocations) for event in events):
             raise ValueError("Program execution events must belong to the scorable's invocations.")
-        if any(event.runtime_profile != self.scorable.runtime_profile for event in events):
+        if any(event.runtime_profile_name != self.scorable.runtime_profile_name for event in events):
             raise ValueError("Program execution events must use the scorable's runtime profile.")
         if self.acquisition is Acquisition.COMPLETE and (
             len(events) != len(self.scorable.invocations) or self.payload.reasons

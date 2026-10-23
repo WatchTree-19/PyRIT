@@ -8,11 +8,11 @@ from typing import TYPE_CHECKING, Annotated, Any, Literal, cast, get_args, get_o
 
 from pydantic import BaseModel, BeforeValidator, ConfigDict, Field, SerializeAsAny, TypeAdapter, model_validator
 
-from pyrit.models.score._trace_validation import ToolName  # noqa: TC001 (runtime-required by Pydantic)
-from pyrit.models.score.program import (  # noqa: TC001 (runtime-required by Pydantic)
-    ProgramInvocation,
-    RuntimeProfileName,
+from pyrit.models.code_execution import (  # noqa: TC001 (runtime-required by Pydantic)
+    _ProgramInvocation,
+    _RuntimeProfileName,
 )
+from pyrit.models.score._trace_validation import ToolName  # noqa: TC001 (runtime-required by Pydantic)
 from pyrit.models.score.surface import SurfaceMatch  # noqa: TC001 (runtime-required by Pydantic)
 from pyrit.models.score.text_matcher import TextMatcher  # noqa: TC001 (runtime-required by Pydantic)
 
@@ -264,7 +264,7 @@ class ProgramCase(BaseModel):
 
     model_config = ConfigDict(frozen=True, extra="forbid")
 
-    invocation: ProgramInvocation = Field(default_factory=ProgramInvocation)
+    invocation: _ProgramInvocation = Field(default_factory=_ProgramInvocation)
     expected: ProgramResult = Field(default_factory=ProgramResult)
 
 
@@ -279,7 +279,7 @@ class ProgramBehaves(Condition):
     """
 
     condition_type: Literal["program_behaves"] = "program_behaves"
-    runtime_profile: RuntimeProfileName
+    runtime_profile_name: _RuntimeProfileName
     cases: tuple[ProgramCase, ...]
 
     @model_validator(mode="after")
@@ -298,7 +298,7 @@ class ProgramBehaves(Condition):
         return self
 
     @property
-    def invocations(self) -> tuple[ProgramInvocation, ...]:
+    def invocations(self) -> tuple[_ProgramInvocation, ...]:
         """The stimuli of every case, in case order, without their expected results."""
         return tuple(case.invocation for case in self.cases)
 

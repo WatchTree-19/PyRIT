@@ -19,26 +19,25 @@ from pyrit.models import (
     Observation,
     ProgramBehaves,
     ProgramCase,
-    ProgramExecutionEvent,
     ProgramExecutionObservationPayload,
     ProgramExecutionScorable,
-    ProgramInvocation,
     ProgramResult,
     Score,
     ScoringExpectation,
     SurfaceScorable,
     scorable_from_dict,
 )
+from pyrit.models.code_execution import _ProgramExecutionEvent, _ProgramInvocation
 
 _SOURCE = ComponentIdentifier(class_name="FakeSource", class_module="tests.fake")
 _DIGEST = "a" * 64
 _IMAGE_DIGEST = "sha256:" + "b" * 64
 
 
-def _event(*, case_index: int = 0, profile: str = "python-3.12", **updates: object) -> ProgramExecutionEvent:
+def _event(*, invocation_index: int = 0, profile: str = "python-3.12", **updates: object) -> _ProgramExecutionEvent:
     values: dict[str, object] = {
-        "case_index": case_index,
-        "runtime_profile": profile,
+        "invocation_index": invocation_index,
+        "runtime_profile_name": profile,
         "runtime_image_digest": _IMAGE_DIGEST,
         "resolved_command": ("python3", "/program/main.py"),
         "exit_code": 0,
@@ -46,15 +45,14 @@ def _event(*, case_index: int = 0, profile: str = "python-3.12", **updates: obje
         "duration_ms": 5,
     }
     values.update(updates)
-    return ProgramExecutionEvent.model_validate(values)
+    return _ProgramExecutionEvent.model_validate(values)
 
 
 def _execution(*, invocations: int = 2, profile: str = "python-3.12") -> ProgramExecutionScorable:
     return ProgramExecutionScorable(
-        execution_id=uuid.uuid4(),
         program=ContentScorable(value="print('ok')"),
-        runtime_profile=profile,
-        invocations=tuple(ProgramInvocation(arguments=(str(index),)) for index in range(invocations)),
+        runtime_profile_name=profile,
+        invocations=tuple(_ProgramInvocation(arguments=(str(index),)) for index in range(invocations)),
     )
 
 
@@ -62,7 +60,7 @@ def _observation(
     *,
     scorable: ProgramExecutionScorable,
     acquisition: Acquisition,
-    events: tuple[ProgramExecutionEvent, ...] = (),
+    events: tuple[_ProgramExecutionEvent, ...] = (),
     reasons: tuple[str, ...] = (),
 ) -> Observation:
     return Observation(
@@ -77,10 +75,10 @@ def _observation(
 
 def test_program_behaves_round_trips_through_condition_registry() -> None:
     condition = ProgramBehaves(
-        runtime_profile="python-3.12",
+        runtime_profile_name="python-3.12",
         cases=(
             ProgramCase(
-                invocation=ProgramInvocation(arguments=("3",), stdin="x"),
+                invocation=_ProgramInvocation(arguments=("3",), stdin="x"),
                 expected=ProgramResult(exit_code=None, stdout=Equals(value="9")),
             ),
         ),
@@ -92,50 +90,36 @@ def test_program_behaves_round_trips_through_condition_registry() -> None:
 
 def test_program_behaves_invocations_drop_expected_results() -> None:
     condition = ProgramBehaves(
-        runtime_profile="python-3.12",
+        runtime_profile_name="python-3.12",
         cases=(
-            ProgramCase(invocation=ProgramInvocation(arguments=("1",)), expected=ProgramResult(exit_code=3)),
-            ProgramCase(invocation=ProgramInvocation(stdin="in")),
+            ProgramCase(invocation=_ProgramInvocation(arguments=("1",)), expected=ProgramResult(exit_code=3)),
+            ProgramCase(invocation=_ProgramInvocation(stdin="in")),
         ),
     )
-    assert condition.invocations == (ProgramInvocation(arguments=("1",)), ProgramInvocation(stdin="in"))
+    assert condition.invocations == (_ProgramInvocation(arguments=("1",)), _ProgramInvocation(stdin="in"))
 
 
 def test_program_case_defaults_expect_a_clean_exit_with_no_arguments() -> None:
     case = ProgramCase()
-    assert case.invocation == ProgramInvocation()
+    assert case.invocation == _ProgramInvocation()
     assert case.expected == ProgramResult(exit_code=0)
 
 
 def test_program_behaves_requires_a_case() -> None:
     with pytest.raises(ValidationError, match="at least one case"):
-        ProgramBehaves(runtime_profile="python-3.12", cases=())
+        ProgramBehaves(runtime_profile_name="python-3.12", cases=())
 
 
-@pytest.mark.parametrize("profile", ["", "-leading-dash", "has space", "image:tag", "a/b", "x" * 65])
-def test_runtime_profile_must_be_a_plain_name(profile: str) -> None:
+def test_condition_validates_its_runtime_profile_name() -> None:
     with pytest.raises(ValidationError):
-        ProgramBehaves(runtime_profile=profile, cases=(ProgramCase(),))
-
-
-def test_invocation_arguments_reject_nul() -> None:
-    with pytest.raises(ValidationError):
-        ProgramInvocation(arguments=("a\x00b",))
-
-
-def test_timed_out_event_cannot_report_an_exit_code() -> None:
-    with pytest.raises(ValidationError, match="timed-out"):
-        _event(timed_out=True, exit_code=0)
-    assert _event(timed_out=True, exit_code=None).output_truncated is False
-    assert _event(stderr_truncated=True).output_truncated is True
+        ProgramBehaves(runtime_profile_name="bad name", cases=(ProgramCase(),))
 
 
 def test_execution_scorable_round_trips_as_a_stored_scorable() -> None:
     message_program = ProgramExecutionScorable(
-        execution_id=uuid.uuid4(),
         program=MessageScorable(message_piece_ids=(uuid.uuid4(),)),
-        runtime_profile="python-3.12",
-        invocations=(ProgramInvocation(),),
+        runtime_profile_name="python-3.12",
+        invocations=(_ProgramInvocation(),),
     )
     for scorable in (message_program, _execution()):
         assert scorable_from_dict(scorable.model_dump(mode="json")) == scorable
@@ -143,34 +127,30 @@ def test_execution_scorable_round_trips_as_a_stored_scorable() -> None:
 
 def test_execution_scorable_accepts_stored_text_content() -> None:
     stored = ProgramExecutionScorable(
-        execution_id=uuid.uuid4(),
         program=ContentEntryScorable(content_id=uuid.uuid4()),
-        runtime_profile="python-3.12",
-        invocations=(ProgramInvocation(),),
+        runtime_profile_name="python-3.12",
+        invocations=(_ProgramInvocation(),),
     )
     assert scorable_from_dict(stored.model_dump(mode="json")) == stored
     with pytest.raises(ValidationError, match="text"):
         ProgramExecutionScorable(
-            execution_id=uuid.uuid4(),
             program=ContentEntryScorable(content_id=uuid.uuid4(), data_type="image_path"),
-            runtime_profile="python-3.12",
-            invocations=(ProgramInvocation(),),
+            runtime_profile_name="python-3.12",
+            invocations=(_ProgramInvocation(),),
         )
 
 
 def test_execution_scorable_requires_text_and_an_invocation() -> None:
     with pytest.raises(ValidationError, match="text"):
         ProgramExecutionScorable(
-            execution_id=uuid.uuid4(),
             program=ContentScorable(value="image.png", data_type="image_path"),
-            runtime_profile="python-3.12",
-            invocations=(ProgramInvocation(),),
+            runtime_profile_name="python-3.12",
+            invocations=(_ProgramInvocation(),),
         )
     with pytest.raises(ValidationError, match="at least one invocation"):
         ProgramExecutionScorable(
-            execution_id=uuid.uuid4(),
             program=ContentScorable(value="print(1)"),
-            runtime_profile="python-3.12",
+            runtime_profile_name="python-3.12",
             invocations=(),
         )
 
@@ -179,9 +159,8 @@ def test_execution_scorable_rejects_a_program_that_is_not_text_or_a_message() ->
     with pytest.raises(ValidationError):
         ProgramExecutionScorable.model_validate(
             {
-                "execution_id": str(uuid.uuid4()),
                 "program": SurfaceScorable(uri="/x").model_dump(),
-                "runtime_profile": "python-3.12",
+                "runtime_profile_name": "python-3.12",
                 "invocations": [{}],
             }
         )
@@ -204,10 +183,10 @@ def test_score_round_trips_an_execution_anchor() -> None:
     "indices",
     [(1, 0), (0, 0)],
 )
-def test_payload_requires_events_once_in_case_order(indices: tuple[int, ...]) -> None:
-    with pytest.raises(ValidationError, match="case order"):
+def test_payload_requires_events_once_in_invocation_order(indices: tuple[int, ...]) -> None:
+    with pytest.raises(ValidationError, match="invocation order"):
         ProgramExecutionObservationPayload(
-            program_sha256=_DIGEST, events=tuple(_event(case_index=index) for index in indices)
+            program_sha256=_DIGEST, events=tuple(_event(invocation_index=index) for index in indices)
         )
 
 
@@ -221,35 +200,35 @@ def test_payload_rejects_a_coerced_schema_version() -> None:
         ProgramExecutionObservationPayload.model_validate({"schema_version": "1"})
 
 
-def test_payload_finds_events_by_case() -> None:
-    payload = ProgramExecutionObservationPayload(program_sha256=_DIGEST, events=(_event(case_index=1),))
-    assert payload.event_for(1) is payload.events[0]
-    assert payload.event_for(0) is None
-
-
 def test_complete_observation_holds_one_event_per_invocation() -> None:
     scorable = _execution()
     observation = _observation(
-        scorable=scorable, acquisition=Acquisition.COMPLETE, events=(_event(case_index=0), _event(case_index=1))
+        scorable=scorable,
+        acquisition=Acquisition.COMPLETE,
+        events=(_event(invocation_index=0), _event(invocation_index=1)),
     )
     assert Observation.model_validate(observation.model_dump(mode="json")) == observation
     with pytest.raises(ValidationError, match="Complete program acquisition"):
-        _observation(scorable=scorable, acquisition=Acquisition.COMPLETE, events=(_event(case_index=0),))
+        _observation(scorable=scorable, acquisition=Acquisition.COMPLETE, events=(_event(invocation_index=0),))
     with pytest.raises(ValidationError, match="Complete program acquisition"):
         _observation(
             scorable=scorable,
             acquisition=Acquisition.COMPLETE,
-            events=(_event(case_index=0), _event(case_index=1)),
+            events=(_event(invocation_index=0), _event(invocation_index=1)),
             reasons=("gap",),
         )
 
 
 def test_partial_observation_is_missing_an_invocation() -> None:
     scorable = _execution()
-    _observation(scorable=scorable, acquisition=Acquisition.PARTIAL, events=(_event(case_index=0),), reasons=("x",))
+    _observation(
+        scorable=scorable, acquisition=Acquisition.PARTIAL, events=(_event(invocation_index=0),), reasons=("x",)
+    )
     with pytest.raises(ValidationError, match="Partial program acquisition"):
         _observation(
-            scorable=scorable, acquisition=Acquisition.PARTIAL, events=(_event(case_index=0), _event(case_index=1))
+            scorable=scorable,
+            acquisition=Acquisition.PARTIAL,
+            events=(_event(invocation_index=0), _event(invocation_index=1)),
         )
 
 
@@ -258,13 +237,13 @@ def test_failed_observation_holds_no_events(acquisition: Acquisition) -> None:
     scorable = _execution()
     _observation(scorable=scorable, acquisition=acquisition, reasons=("sandbox down",))
     with pytest.raises(ValidationError, match="cannot contain events"):
-        _observation(scorable=scorable, acquisition=acquisition, events=(_event(case_index=0),))
+        _observation(scorable=scorable, acquisition=acquisition, events=(_event(invocation_index=0),))
 
 
 def test_observation_events_must_belong_to_the_scorable() -> None:
     scorable = _execution(invocations=1)
     with pytest.raises(ValidationError, match="belong to the scorable"):
-        _observation(scorable=scorable, acquisition=Acquisition.PARTIAL, events=(_event(case_index=1),))
+        _observation(scorable=scorable, acquisition=Acquisition.PARTIAL, events=(_event(invocation_index=1),))
     with pytest.raises(ValidationError, match="runtime profile"):
         _observation(scorable=scorable, acquisition=Acquisition.COMPLETE, events=(_event(profile="node-20"),))
 

@@ -14,13 +14,13 @@ from pyrit.models import (
     MessagePiece,
     MessageScorable,
     ProgramExecutionScorable,
-    ProgramInvocation,
     Scorable,
     Score,
     SurfaceScorable,
     TraceScorable,
     scorable_from_dict,
 )
+from pyrit.models.code_execution import _ProgramInvocation
 from pyrit.models.score.scorable import SCORABLE_TYPES
 
 
@@ -158,10 +158,9 @@ def test_every_union_member_round_trips_to_its_own_type():
         SurfaceScorable(uri="/data/out.txt"),
         ConversationScorable(conversation_id="whole-conversation"),
         ProgramExecutionScorable(
-            execution_id=uuid.uuid4(),
             program=ContentScorable(value="print(1)"),
-            runtime_profile="python-3.12",
-            invocations=(ProgramInvocation(),),
+            runtime_profile_name="python-3.12",
+            invocations=(_ProgramInvocation(),),
         ),
     ]
 

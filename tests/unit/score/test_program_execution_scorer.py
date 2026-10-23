@@ -7,9 +7,11 @@ import asyncio
 import hashlib
 import uuid
 from typing import TYPE_CHECKING
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
+from pyrit._code_execution import DockerRuntimeProfile, DockerSandboxClient, SandboxExecutionError
 from pyrit.models import (
     Acquisition,
     ComponentIdentifier,
@@ -20,29 +22,25 @@ from pyrit.models import (
     Equals,
     MessagePiece,
     MessageScorable,
-    Observation,
     ProgramBehaves,
     ProgramCase,
-    ProgramExecutionEvent,
     ProgramExecutionObservationPayload,
     ProgramExecutionScorable,
-    ProgramInvocation,
     ProgramResult,
     Regex,
     ScoreStatus,
     ScoringExpectation,
     SurfaceScorable,
 )
+from pyrit.models.code_execution import _ProgramExecutionEvent, _ProgramInvocation, _SandboxRun
 from pyrit.score import (
     NonReplayableObservationError,
     ProgramExecutionScorer,
     ProgramExecutionSource,
-    SandboxClient,
-    SandboxExecutionError,
-    SandboxRun,
     TrueFalseInverterScorer,
 )
-from pyrit.score.true_false.program_execution_scorer import match_case, match_program_behaves
+from pyrit.score.text_matching import match_text
+from pyrit.score.true_false.program_execution_scorer import _evaluate_case, _evaluate_program
 
 if TYPE_CHECKING:
     from pyrit.memory import SQLiteMemory
@@ -54,10 +52,10 @@ _PROFILE = "python-3.12"
 _IMAGE_DIGEST = "sha256:" + "b" * 64
 
 
-def _event(*, case_index: int = 0, **updates: object) -> ProgramExecutionEvent:
+def _event(*, invocation_index: int = 0, **updates: object) -> _ProgramExecutionEvent:
     values: dict[str, object] = {
-        "case_index": case_index,
-        "runtime_profile": _PROFILE,
+        "invocation_index": invocation_index,
+        "runtime_profile_name": _PROFILE,
         "runtime_image_digest": _IMAGE_DIGEST,
         "resolved_command": ("python3", "/program/main.py"),
         "exit_code": 0,
@@ -65,7 +63,7 @@ def _event(*, case_index: int = 0, **updates: object) -> ProgramExecutionEvent:
         "duration_ms": 1,
     }
     values.update(updates)
-    return ProgramExecutionEvent.model_validate(values)
+    return _ProgramExecutionEvent.model_validate(values)
 
 
 class _FakeSandbox:
@@ -74,40 +72,42 @@ class _FakeSandbox:
     def __init__(self, *, outputs: dict[str, dict[str, object]] | None = None, profiles: frozenset[str] | None = None):
         self.outputs = outputs or {}
         self.profiles = profiles or frozenset({_PROFILE})
-        self.calls: list[tuple[str, str, tuple[ProgramInvocation, ...]]] = []
+        self.calls: list[tuple[str, str, tuple[_ProgramInvocation, ...]]] = []
         self.error: SandboxExecutionError | None = None
         self.stop_after: int | None = None
 
     def get_identifier(self) -> ComponentIdentifier:
         return ComponentIdentifier.of(self, params={"fake": True})
 
-    def get_runtime_profiles(self) -> frozenset[str]:
+    def get_runtime_profile_names(self) -> frozenset[str]:
         return self.profiles
 
     async def execute_async(
-        self, *, program: str, runtime_profile: str, invocations: tuple[ProgramInvocation, ...]
-    ) -> SandboxRun:
-        self.calls.append((program, runtime_profile, invocations))
+        self, *, program: str, runtime_profile_name: str, invocations: tuple[_ProgramInvocation, ...]
+    ) -> _SandboxRun:
+        self.calls.append((program, runtime_profile_name, invocations))
         if self.error is not None:
             raise self.error
         ran = invocations if self.stop_after is None else invocations[: self.stop_after]
         events = tuple(
-            _event(case_index=index, **self.outputs.get(invocation.arguments[0] if invocation.arguments else "", {}))
+            _event(
+                invocation_index=index, **self.outputs.get(invocation.arguments[0] if invocation.arguments else "", {})
+            )
             for index, invocation in enumerate(ran)
         )
         reasons = ("the sandbox lost its worker",) if len(ran) < len(invocations) else ()
-        return SandboxRun(events=events, reasons=reasons)
+        return _SandboxRun(events=events, reasons=reasons)
 
 
 def _case(argument: str, *, exit_code: int | None = 0, stdout: TextMatcher | None = None) -> ProgramCase:
     return ProgramCase(
-        invocation=ProgramInvocation(arguments=(argument,)),
+        invocation=_ProgramInvocation(arguments=(argument,)),
         expected=ProgramResult(exit_code=exit_code, stdout=stdout),
     )
 
 
 def _expectation(*cases: ProgramCase, profile: str = _PROFILE) -> ScoringExpectation:
-    return ScoringExpectation(conditions=(ProgramBehaves(runtime_profile=profile, cases=cases),))
+    return ScoringExpectation(conditions=(ProgramBehaves(runtime_profile_name=profile, cases=cases),))
 
 
 _SQUARES = (_case("3", stdout=Equals(value="9")), _case("4", stdout=Equals(value="16")))
@@ -144,27 +144,27 @@ def _scorer(sandbox: _FakeSandbox, *, max_output_chars: int = 64_000) -> Program
         ),
     ],
 )
-def test_match_case(*, expected: ProgramResult, event: dict[str, object], result: bool | None) -> None:
-    assert match_case(expected=expected, event=_event(**event)) is result
+def test_evaluate_case(*, expected: ProgramResult, event: dict[str, object], result: bool | None) -> None:
+    assert _evaluate_case(expected=expected, event=_event(**event)).value is result
 
 
-def test_match_program_behaves_needs_every_case() -> None:
-    condition = ProgramBehaves(runtime_profile=_PROFILE, cases=_SQUARES)
-    passing = (_event(case_index=0, stdout="9"), _event(case_index=1, stdout="16"))
+def test_evaluate_program_needs_every_case() -> None:
+    condition = ProgramBehaves(runtime_profile_name=_PROFILE, cases=_SQUARES)
+    passing = (_event(invocation_index=0, stdout="9"), _event(invocation_index=1, stdout="16"))
     payload = ProgramExecutionObservationPayload(program_sha256="a" * 64, events=passing)
-    assert match_program_behaves(condition=condition, payload=payload, acquisition=Acquisition.COMPLETE) is True
+    assert _evaluate_program(condition=condition, payload=payload, acquisition=Acquisition.COMPLETE).value is True
 
     one_ran = ProgramExecutionObservationPayload(program_sha256="a" * 64, events=passing[:1])
-    assert match_program_behaves(condition=condition, payload=one_ran, acquisition=Acquisition.PARTIAL) is None
+    assert _evaluate_program(condition=condition, payload=one_ran, acquisition=Acquisition.PARTIAL).value is None
 
     failing_first = ProgramExecutionObservationPayload(
-        program_sha256="a" * 64, events=(_event(case_index=0, stdout="8"),)
+        program_sha256="a" * 64, events=(_event(invocation_index=0, stdout="8"),)
     )
-    assert match_program_behaves(condition=condition, payload=failing_first, acquisition=Acquisition.PARTIAL) is False
+    assert _evaluate_program(condition=condition, payload=failing_first, acquisition=Acquisition.PARTIAL).value is False
 
     empty = ProgramExecutionObservationPayload(reasons=("down",))
     for acquisition in (Acquisition.ERROR, Acquisition.UNAVAILABLE):
-        assert match_program_behaves(condition=condition, payload=empty, acquisition=acquisition) is None
+        assert _evaluate_program(condition=condition, payload=empty, acquisition=acquisition).value is None
 
 
 async def test_scores_true_when_every_case_passes_async(sqlite_instance: SQLiteMemory) -> None:
@@ -188,7 +188,7 @@ async def test_sandbox_receives_stimuli_but_not_expected_results_async() -> None
     secret = "the-expected-answer"
     expectation = _expectation(
         ProgramCase(
-            invocation=ProgramInvocation(arguments=("3",), stdin="in"),
+            invocation=_ProgramInvocation(arguments=("3",), stdin="in"),
             expected=ProgramResult(stdout=Equals(value=secret)),
         )
     )
@@ -197,8 +197,95 @@ async def test_sandbox_receives_stimuli_but_not_expected_results_async() -> None
 
     program, profile, invocations = sandbox.calls[0]
     assert (program, profile) == ("print(1)", _PROFILE)
-    assert invocations == (ProgramInvocation(arguments=("3",), stdin="in"),)
+    assert invocations == (_ProgramInvocation(arguments=("3",), stdin="in"),)
     assert secret not in repr(sandbox.calls)
+
+
+async def test_scoring_and_replay_do_not_require_runtime_provenance_async(sqlite_instance: SQLiteMemory) -> None:
+    sandbox = _FakeSandbox(outputs={"3": {"stdout": "9", "runtime_image_digest": None, "resolved_command": None}})
+    scorer = _scorer(sandbox)
+    expectation = _expectation(_case("3", stdout=Equals(value="9")))
+    score = (await scorer.score_async(scorable=ContentScorable(value="print(9)"), expectation=expectation))[0]
+    observation = (await sqlite_instance.get_observations_async(observation_ids=score.observation_ids))[0]
+
+    assert score.get_value() is True
+    assert isinstance(observation.payload, ProgramExecutionObservationPayload)
+    assert observation.payload.events[0].runtime_image_digest is None
+    assert observation.payload.events[0].resolved_command is None
+    replayed = (await scorer.score_observation_async(observation=observation, expectation=expectation))[0]
+    assert replayed.get_value() is True
+    assert replayed.observation_ids == score.observation_ids
+    assert len(sandbox.calls) == 1
+    saved = (await sqlite_instance.get_scores_async(score_ids=[str(replayed.id)]))[0]
+    assert saved.get_value() is True
+    assert saved.scored_expectation == expectation
+
+
+async def test_cases_are_matched_once_for_verdict_and_rationale_async() -> None:
+    sandbox = _FakeSandbox(outputs={"3": {"stdout": "9"}, "4": {"stdout": "wrong"}})
+    with patch("pyrit.score.true_false.program_execution_scorer.match_text", wraps=match_text) as matching:
+        score = (
+            await _scorer(sandbox).score_async(
+                scorable=ContentScorable(value="print(1)"), expectation=_expectation(*_SQUARES)
+            )
+        )[0]
+    assert score.get_value() is False
+    assert "case 1 output did not match" in score.score_rationale
+    assert matching.call_count == 2
+
+
+@pytest.mark.parametrize(
+    ("failure", "rationale"),
+    [
+        ("lost-output", "output capture may be incomplete"),
+        ("resource-limits", "must support cgroup"),
+        ("image-volumes", "must not declare volumes"),
+    ],
+)
+async def test_unsafe_docker_execution_cannot_produce_a_passing_score_async(
+    sqlite_instance: SQLiteMemory, failure: str, rationale: str
+) -> None:
+    client = DockerSandboxClient(
+        profiles={_PROFILE: DockerRuntimeProfile(image="python@" + _IMAGE_DIGEST, command=("python3", "-I"))}
+    )
+    process = MagicMock(spec=asyncio.subprocess.Process)
+    process.returncode = 1
+    process.stdin = None
+    for name, data in (("stdout", b"ok"), ("stderr", b"attachment failed")):
+        reader = asyncio.StreamReader()
+        reader.feed_data(data)
+        reader.feed_eof()
+        setattr(process, name, reader)
+    process.communicate = AsyncMock(return_value=(b"", b""))
+
+    async def control_async(*arguments: str) -> tuple[int, str]:
+        if arguments[0] == "info":
+            driver = "none" if failure == "resource-limits" else "cgroupfs"
+            return 0, f"{driver} true true true true true"
+        if arguments[:2] == ("image", "inspect"):
+            return 0, '{"/data":{}}' if failure == "image-volumes" else "null"
+        if arguments[0] == "inspect":
+            return 0, "exited 0 false 2026-10-21T00:00:00Z"
+        assert arguments[:3] == ("rm", "--force", "--volumes")
+        return 0, ""
+
+    scorer = ProgramExecutionScorer(source=ProgramExecutionSource(sandbox=client))
+    expectation = _expectation(_case("3", stdout=Equals(value="ok")))
+    with (
+        patch("asyncio.create_subprocess_exec", new_callable=AsyncMock, return_value=process) as launch,
+        patch.object(client, "_control_async", side_effect=control_async),
+    ):
+        score = (await scorer.score_async(scorable=ContentScorable(value="print('okextra')"), expectation=expectation))[
+            0
+        ]
+    assert score.status is ScoreStatus.UNDETERMINED
+    assert score.score_value is None
+    assert rationale in score.score_rationale
+    assert launch.await_count == (1 if failure == "lost-output" else 0)
+    observation = (await sqlite_instance.get_observations_async(observation_ids=score.observation_ids))[0]
+    assert observation.acquisition is Acquisition.ERROR
+    assert isinstance(observation.payload, ProgramExecutionObservationPayload)
+    assert observation.payload.events == ()
 
 
 async def test_scores_false_when_one_case_fails_async() -> None:
@@ -339,80 +426,61 @@ async def test_replay_rejects_different_stimuli_async(sqlite_instance: SQLiteMem
         )
 
 
-async def test_each_scoring_call_is_a_new_execution_async() -> None:
+@pytest.mark.parametrize("explicit", [False, True])
+@pytest.mark.parametrize("concurrent", [False, True])
+async def test_scoring_calls_store_independent_executions_async(
+    sqlite_instance: SQLiteMemory, explicit: bool, concurrent: bool
+) -> None:
     sandbox = _FakeSandbox()
     scorer = _scorer(sandbox)
     program = ContentScorable(value="x")
 
-    first = (await scorer.score_async(scorable=program, expectation=_expectation(_case("1"))))[0]
-    second = (await scorer.score_async(scorable=program, expectation=_expectation(_case("1"))))[0]
+    execution = ProgramExecutionScorable(
+        program=program,
+        runtime_profile_name=_PROFILE,
+        invocations=(_ProgramInvocation(arguments=("1",)),),
+    )
+
+    scorable = execution if explicit else program
+    expectation = _expectation(_case("1"))
+    if concurrent:
+        first_scores, second_scores = await asyncio.gather(
+            scorer.score_async(scorable=scorable, expectation=expectation),
+            scorer.score_async(scorable=scorable, expectation=expectation),
+        )
+    else:
+        first_scores = await scorer.score_async(scorable=scorable, expectation=expectation)
+        second_scores = await scorer.score_async(scorable=scorable, expectation=expectation)
+    first, second = first_scores[0], second_scores[0]
 
     assert len(sandbox.calls) == 2
     assert first.observation_ids != second.observation_ids
+    stored = await sqlite_instance.get_scores_async(score_ids=[str(first.id), str(second.id)])
+    assert len(stored) == 2
+    assert all(score.get_value() is True for score in stored)
 
 
-async def test_explicit_execution_reuses_its_observed_run_async() -> None:
-    sandbox = _FakeSandbox()
-    scorer = _scorer(sandbox)
-    execution = ProgramExecutionScorable(
-        execution_id=uuid.uuid4(),
-        program=ContentScorable(value="x"),
-        runtime_profile=_PROFILE,
-        invocations=(ProgramInvocation(arguments=("1",)),),
-    )
-
-    first = (await scorer.score_async(scorable=execution, expectation=_expectation(_case("1"))))[0]
-    second = (await scorer.score_async(scorable=execution, expectation=_expectation(_case("1", exit_code=None))))[0]
-
-    assert len(sandbox.calls) == 1
-    assert first.observation_ids == second.observation_ids
-    assert first.scorable == execution
-
-
-async def test_sandbox_errors_are_not_reused_async() -> None:
-    sandbox = _FakeSandbox()
-    sandbox.error = SandboxExecutionError("down")
-    source = ProgramExecutionSource(sandbox=sandbox)
-    execution = ProgramExecutionScorable(
-        execution_id=uuid.uuid4(),
-        program=ContentScorable(value="x"),
-        runtime_profile=_PROFILE,
-        invocations=(ProgramInvocation(),),
-    )
-
-    assert (await source.acquire_async(scorable=execution)).acquisition is Acquisition.ERROR
-    sandbox.error = None
-    assert (await source.acquire_async(scorable=execution)).acquisition is Acquisition.COMPLETE
-    assert len(sandbox.calls) == 2
-
-
-async def test_a_run_with_no_events_is_an_error_and_not_reused_async() -> None:
+async def test_a_run_with_no_events_is_an_acquisition_error_async() -> None:
     sandbox = _FakeSandbox()
     sandbox.stop_after = 0
     source = ProgramExecutionSource(sandbox=sandbox)
     execution = ProgramExecutionScorable(
-        execution_id=uuid.uuid4(),
         program=ContentScorable(value="x"),
-        runtime_profile=_PROFILE,
-        invocations=(ProgramInvocation(),),
+        runtime_profile_name=_PROFILE,
+        invocations=(_ProgramInvocation(),),
     )
 
     failed = await source.acquire_async(scorable=execution)
-    sandbox.stop_after = None
-    retried = await source.acquire_async(scorable=execution)
-
     assert failed.acquisition is Acquisition.ERROR
     assert isinstance(failed.payload, ProgramExecutionObservationPayload)
     assert failed.payload.reasons == ("the sandbox lost its worker",)
-    assert retried.acquisition is Acquisition.COMPLETE
 
 
 async def test_explicit_execution_must_match_the_condition_async() -> None:
     execution = ProgramExecutionScorable(
-        execution_id=uuid.uuid4(),
         program=ContentScorable(value="x"),
-        runtime_profile=_PROFILE,
-        invocations=(ProgramInvocation(arguments=("2",)),),
+        runtime_profile_name=_PROFILE,
+        invocations=(_ProgramInvocation(arguments=("2",)),),
     )
 
     with pytest.raises(RuntimeError, match="runtime profile and invocations"):
@@ -514,10 +582,6 @@ async def test_inverter_keeps_undetermined_async() -> None:
     assert inverted.get_value() is False
 
 
-def test_fake_sandbox_satisfies_the_protocol() -> None:
-    assert isinstance(_FakeSandbox(), SandboxClient)
-
-
 def test_source_rejects_a_nonpositive_output_limit() -> None:
     with pytest.raises(ValueError, match="positive"):
         ProgramExecutionSource(sandbox=_FakeSandbox(), max_output_chars=0)
@@ -533,195 +597,22 @@ def test_identifier_names_the_source_and_sandbox() -> None:
 
 async def test_source_rejects_events_for_unknown_invocations_async() -> None:
     class _Rogue(_FakeSandbox):
-        async def execute_async(self, *, program, runtime_profile, invocations):  # type: ignore[no-untyped-def]
-            return SandboxRun(events=(_event(case_index=5),))
+        async def execute_async(self, *, program, runtime_profile_name, invocations):  # type: ignore[no-untyped-def]
+            return _SandboxRun(events=(_event(invocation_index=5),))
 
     execution = ProgramExecutionScorable(
-        execution_id=uuid.uuid4(),
         program=ContentScorable(value="x"),
-        runtime_profile=_PROFILE,
-        invocations=(ProgramInvocation(),),
+        runtime_profile_name=_PROFILE,
+        invocations=(_ProgramInvocation(),),
     )
     with pytest.raises(ValueError, match="not given"):
         await ProgramExecutionSource(sandbox=_Rogue()).acquire_async(scorable=execution)
 
 
-def test_observation_round_trip_keeps_the_program_reference() -> None:
-    execution = ProgramExecutionScorable(
-        execution_id=uuid.uuid4(),
-        program=ContentScorable(value="x"),
-        runtime_profile=_PROFILE,
-        invocations=(ProgramInvocation(),),
-    )
-    observation = Observation(
-        source_identifier=ComponentIdentifier(class_name="S", class_module="m"),
-        acquisition=Acquisition.COMPLETE,
-        scorable=execution,
-        payload=ProgramExecutionObservationPayload(program_sha256="a" * 64, events=(_event(),)),
-    )
-    assert Observation.model_validate(observation.model_dump(mode="json")) == observation
-
-
-class _SlowSandbox(_FakeSandbox):
-    """Holds each run open until released, so concurrent callers overlap."""
-
-    def __init__(self) -> None:
-        super().__init__()
-        self.release = asyncio.Event()
-
-    async def execute_async(self, *, program, runtime_profile, invocations):  # type: ignore[no-untyped-def]
-        self.calls.append((program, runtime_profile, invocations))
-        await self.release.wait()
-        return SandboxRun(events=tuple(_event(case_index=index) for index in range(len(invocations))))
-
-
-def _attempt() -> ProgramExecutionScorable:
-    return ProgramExecutionScorable(
-        execution_id=uuid.uuid4(),
-        program=ContentScorable(value="x"),
-        runtime_profile=_PROFILE,
-        invocations=(ProgramInvocation(),),
-    )
-
-
-async def test_concurrent_callers_share_one_run_of_an_attempt_async() -> None:
-    sandbox = _SlowSandbox()
-    source = ProgramExecutionSource(sandbox=sandbox)
-    execution = _attempt()
-
-    pending = asyncio.gather(source.acquire_async(scorable=execution), source.acquire_async(scorable=execution))
-    await asyncio.sleep(0)
-    sandbox.release.set()
-    first, second = await pending
-
-    assert len(sandbox.calls) == 1
-    assert first.id == second.id
-
-
-async def test_one_cancelled_caller_does_not_cancel_the_shared_run_async() -> None:
-    sandbox = _SlowSandbox()
-    source = ProgramExecutionSource(sandbox=sandbox)
-    execution = _attempt()
-
-    cancelled = asyncio.create_task(source.acquire_async(scorable=execution))
-    kept = asyncio.create_task(source.acquire_async(scorable=execution))
-    await asyncio.sleep(0)
-    cancelled.cancel()
-    await asyncio.sleep(0)
-    sandbox.release.set()
-
-    observation = await kept
-    with pytest.raises(asyncio.CancelledError):
-        await cancelled
-    assert observation.acquisition is Acquisition.COMPLETE
-    assert len(sandbox.calls) == 1
-
-
-async def test_a_run_nobody_waits_for_is_cancelled_async() -> None:
-    sandbox = _SlowSandbox()
-    source = ProgramExecutionSource(sandbox=sandbox)
-    execution = _attempt()
-
-    task = asyncio.create_task(source.acquire_async(scorable=execution))
-    await asyncio.sleep(0)
-    flight = source._in_flight[execution]
-    task.cancel()
-    with pytest.raises(asyncio.CancelledError):
-        await task
-    await asyncio.sleep(0)
-
-    assert flight.task.cancelled()
-    assert execution not in source._in_flight
-
-
-class _SlowCleanupSandbox(_SlowSandbox):
-    """Holds its cleanup open after cancellation until released."""
-
-    def __init__(self) -> None:
-        super().__init__()
-        self.cleanup_started = asyncio.Event()
-        self.cleanup_release = asyncio.Event()
-        self.cleaned_up = False
-
-    async def execute_async(self, *, program, runtime_profile, invocations):  # type: ignore[no-untyped-def]
-        try:
-            return await super().execute_async(
-                program=program, runtime_profile=runtime_profile, invocations=invocations
-            )
-        except asyncio.CancelledError:
-            self.cleanup_started.set()
-            await self.cleanup_release.wait()
-            self.cleaned_up = True
-            raise
-
-
-async def test_cancelling_the_last_caller_waits_for_sandbox_cleanup_async() -> None:
-    sandbox = _SlowCleanupSandbox()
-    source = ProgramExecutionSource(sandbox=sandbox)
-    execution = _attempt()
-
-    task = asyncio.create_task(source.acquire_async(scorable=execution))
-    # The source checks memory before it runs the program, so wait for the run itself to start.
-    for _ in range(500):
-        if sandbox.calls:
-            break
-        await asyncio.sleep(0.01)
-    assert sandbox.calls
-    task.cancel()
-    await asyncio.wait_for(sandbox.cleanup_started.wait(), timeout=5)
-    for _ in range(5):
-        await asyncio.sleep(0)
-    assert not task.done(), "cancellation finished before the sandbox cleaned up"
-
-    sandbox.cleanup_release.set()
-    with pytest.raises(asyncio.CancelledError):
-        await task
-    assert sandbox.cleaned_up
-    assert execution not in source._in_flight
-
-
-async def test_concurrent_scoring_of_one_attempt_stores_its_observation_once_async(
-    sqlite_instance: SQLiteMemory,
-) -> None:
-    sandbox = _SlowSandbox()
-    scorer = ProgramExecutionScorer(source=ProgramExecutionSource(sandbox=sandbox))
-    execution = _attempt()
-    expectation = _expectation(ProgramCase(invocation=ProgramInvocation()))
-    # Hold both callers at the write until each has done every read, so neither sees the
-    # other's observation already stored.
-    arrived, both_arrived = 0, asyncio.Event()
-    write = sqlite_instance.add_scores_to_memory_async
-
-    async def write_together(**kwargs):  # type: ignore[no-untyped-def]
-        nonlocal arrived
-        arrived += 1
-        if arrived == 2:
-            both_arrived.set()
-        await asyncio.wait_for(both_arrived.wait(), timeout=5)
-        return await write(**kwargs)
-
-    sqlite_instance.add_scores_to_memory_async = write_together  # type: ignore[method-assign]
-
-    pending = asyncio.gather(
-        scorer.score_async(scorable=execution, expectation=expectation),
-        scorer.score_async(scorable=execution, expectation=expectation),
-    )
-    await asyncio.sleep(0)
-    sandbox.release.set()
-    first, second = await pending
-
-    assert len(sandbox.calls) == 1
-    assert first[0].score_value == second[0].score_value == "true"
-    assert first[0].observation_ids == second[0].observation_ids
-    stored = await sqlite_instance.get_scores_async(score_ids=[first[0].id, second[0].id])
-    assert len(stored) == 2
-    assert len(await sqlite_instance.get_observations_async(observation_ids=first[0].observation_ids)) == 1
-
-
 async def test_sandbox_warnings_are_kept_on_the_observation_async(sqlite_instance: SQLiteMemory) -> None:
     class _LeakySandbox(_FakeSandbox):
-        async def execute_async(self, *, program, runtime_profile, invocations):  # type: ignore[no-untyped-def]
-            return SandboxRun(
+        async def execute_async(self, *, program, runtime_profile_name, invocations):  # type: ignore[no-untyped-def]
+            return _SandboxRun(
                 events=(_event(),), warnings=("could not remove container pyrit-sandbox-1: daemon unavailable",)
             )
 
@@ -754,80 +645,16 @@ async def test_scoring_a_saved_score_anchor_runs_the_stored_program_async(sqlite
     assert observation.scorable.program == saved.scorable
 
 
-class _ChangingSandbox(_FakeSandbox):
-    """Prints something different on every run, so a second run of one attempt would show."""
-
-    async def execute_async(self, *, program, runtime_profile, invocations):  # type: ignore[no-untyped-def]
-        self.calls.append((program, runtime_profile, invocations))
-        stdout = "9" if len(self.calls) == 1 else f"run {len(self.calls)}"
-        return SandboxRun(events=tuple(_event(case_index=index, stdout=stdout) for index in range(len(invocations))))
-
-
-async def test_a_stored_attempt_is_reused_after_the_source_evicts_it_async(sqlite_instance: SQLiteMemory) -> None:
-    sandbox = _ChangingSandbox()
-    source = ProgramExecutionSource(sandbox=sandbox)
-    scorer = ProgramExecutionScorer(source=source)
-    expectation = _expectation(_case("3", stdout=Equals(value="9")))
-    execution = ProgramExecutionScorable(
-        execution_id=uuid.uuid4(),
-        program=ContentScorable(value="x"),
-        runtime_profile=_PROFILE,
-        invocations=(ProgramInvocation(arguments=("3",)),),
-    )
-
-    first = (await scorer.score_async(scorable=execution, expectation=expectation))[0]
-    for _ in range(ProgramExecutionSource._MAX_REUSED_OBSERVATIONS):
-        await source.acquire_async(scorable=_attempt())
-    assert execution not in source._observed
-    again = (await scorer.score_async(scorable=execution, expectation=expectation))[0]
-
-    runs_of_execution = [call for call in sandbox.calls if call[2] == execution.invocations]
-    assert len(runs_of_execution) == 1
-    assert (first.score_value, again.score_value) == ("true", "true")
-    assert first.observation_ids == again.observation_ids
-    stored = await sqlite_instance.get_scores_async(score_ids=[first.id, again.id])
-    assert len(stored) == 2
-    assert len(await sqlite_instance.get_observations_async(observation_ids=first.observation_ids)) == 1
-
-
-async def test_errors_are_retried_as_new_observations_not_the_attempts_evidence_async() -> None:
+async def test_each_acquisition_returns_new_evidence_without_memory_async() -> None:
     sandbox = _FakeSandbox()
     source = ProgramExecutionSource(sandbox=sandbox)
-    execution = _attempt()
-    sandbox.error = SandboxExecutionError("no daemon")
-
-    failed = await source.acquire_async(scorable=execution)
-    sandbox.error = None
-    ran = await source.acquire_async(scorable=execution)
-
-    assert failed.acquisition is Acquisition.ERROR
-    assert ran.acquisition is Acquisition.COMPLETE
-    assert failed.id != ran.id
-    assert ran.id == ProgramExecutionSource(sandbox=sandbox)._attempt_observation_id(execution)
-
-
-async def test_two_sources_cannot_store_two_runs_of_one_attempt_async(sqlite_instance: SQLiteMemory) -> None:
-    first_sandbox, second_sandbox = _SlowSandbox(), _SlowSandbox()
-    scorers = [_scorer(first_sandbox), _scorer(second_sandbox)]
-    execution = _attempt()
-    expectation = _expectation(ProgramCase(invocation=ProgramInvocation(), expected=ProgramResult()))
-
-    pending = asyncio.gather(
-        *(scorer.score_async(scorable=execution, expectation=expectation) for scorer in scorers),
-        return_exceptions=True,
+    execution = ProgramExecutionScorable(
+        program=ContentScorable(value="x"), runtime_profile_name=_PROFILE, invocations=(_ProgramInvocation(),)
     )
-    for _ in range(500):
-        if first_sandbox.calls and second_sandbox.calls:
-            break
-        await asyncio.sleep(0.01)
-    first_sandbox.release.set()
-    second_sandbox.release.set()
-    results = await pending
-
-    # Each source ran the attempt, so the later store is refused rather than keeping a second run.
-    errors = [result for result in results if isinstance(result, BaseException)]
-    stored = [result for result in results if not isinstance(result, BaseException)]
-    assert len(errors) == 1
-    assert "already exist" in str(errors[0])
-    assert len(stored) == 1
-    assert len(await sqlite_instance.get_observations_async(observation_ids=stored[0][0].observation_ids)) == 1
+    with patch("pyrit.score.observation.program_execution_source.CentralMemory.get_memory_instance") as memory:
+        memory.side_effect = AssertionError("Loose program acquisition must not read memory")
+        first = await source.acquire_async(scorable=execution)
+        second = await source.acquire_async(scorable=execution)
+    assert first.id != second.id
+    assert first.scorable == second.scorable == execution
+    assert len(sandbox.calls) == 2

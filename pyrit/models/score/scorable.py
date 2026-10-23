@@ -9,12 +9,12 @@ from typing import TYPE_CHECKING, Annotated, Any, Literal, get_args
 
 from pydantic import BaseModel, ConfigDict, Field, TypeAdapter, model_validator
 
+from pyrit.models.code_execution import (  # noqa: TC001 (runtime-required by Pydantic)
+    _ProgramInvocation,
+    _RuntimeProfileName,
+)
 from pyrit.models.literals import PromptDataType  # noqa: TC001  (runtime-required by Pydantic field annotations)
 from pyrit.models.score._trace_validation import TraceId  # noqa: TC001 (runtime-required by Pydantic)
-from pyrit.models.score.program import (  # noqa: TC001 (runtime-required by Pydantic)
-    ProgramInvocation,
-    RuntimeProfileName,
-)
 from pyrit.models.score.surface import SurfaceMatch  # noqa: TC001 (runtime-required by Pydantic)
 
 if TYPE_CHECKING:
@@ -177,22 +177,21 @@ class SurfaceScorable(Scorable):
 
 class ProgramExecutionScorable(Scorable):
     """
-    One isolated execution attempt of a program: the program, its runtime, and its invocations.
+    A program, its runtime, and the invocations to execute.
 
     This is an acquisition request, not a result: it holds no expected output, so the source
     that runs it cannot see which output passes. ``program`` names the code to run: a stored
     message with one text piece, loose text, or stored loose text. It is used verbatim; code is never
     extracted from surrounding prose.
 
-    ``execution_id`` identifies the attempt. Reusing a scorable reuses one observed execution,
-    and a caller that wants a fresh run mints a new id.
+    Each acquisition runs afresh. The resulting observation's ID identifies that run;
+    replay uses the stored observation, not this input description.
     """
 
     scorable_type: Literal["program_execution"] = "program_execution"
-    execution_id: uuid.UUID
     program: Annotated[MessageScorable | ContentScorable | ContentEntryScorable, Field(discriminator="scorable_type")]
-    runtime_profile: RuntimeProfileName
-    invocations: tuple[ProgramInvocation, ...]
+    runtime_profile_name: _RuntimeProfileName
+    invocations: tuple[_ProgramInvocation, ...]
 
     @model_validator(mode="after")
     def _validate_execution(self) -> ProgramExecutionScorable:

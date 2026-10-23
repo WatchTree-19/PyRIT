@@ -42,7 +42,6 @@ if TYPE_CHECKING:
         SurfaceObservationPayload,
         ToolEventsObservationPayload,
     )
-    from pyrit.models.score.program import ProgramExecutionEvent, ProgramInvocation
     from pyrit.models.score.scorable import (
         ContentEntryScorable,
         ContentScorable,
@@ -77,10 +76,8 @@ if TYPE_CHECKING:
 _LAZY_EXPORTS: dict[str, str] = {
     "ProgramBehaves": "pyrit.models.score.condition",
     "ProgramCase": "pyrit.models.score.condition",
-    "ProgramExecutionEvent": "pyrit.models.score.program",
     "ProgramExecutionObservationPayload": "pyrit.models.score.observation",
     "ProgramExecutionScorable": "pyrit.models.score.scorable",
-    "ProgramInvocation": "pyrit.models.score.program",
     "ProgramResult": "pyrit.models.score.condition",
     "ConversationScorable": "pyrit.models.score.scorable",
     "ConversationObservationPayload": "pyrit.models.score.observation",
