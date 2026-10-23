@@ -378,8 +378,8 @@ The below talks about responsibilities of most modules in the PyRIT library
   from `pyrit._code_execution`. Execution inputs and results are private types in `pyrit.models.code_execution`.
 - `runtime_profile_name` selects a client-owned configuration by name, not by supplying an image or command.
   Clients advertise the available names through `get_runtime_profile_names()`.
-- The caller supplies the backend and trusted runtimes. The optional `DockerSandboxClient` uses an
-  existing daemon and pre-pulled images; it creates and removes only its disposable containers.
+- PyRIT does not own environments. The one-image Docker example is the only exception:
+  `DockerSandboxClient` manages disposable containers; callers supply the daemon and pinned image.
 - **Does not own**: interpreting results, scoring criteria, message or seed creation, memory
   persistence, or infrastructure setup. Those remain with the consumer or caller.
 
