@@ -111,14 +111,14 @@ async def _legacy_score_scorable_async(
     return scores
 
 
-def _reject_typed_legacy_condition(cls: type) -> None:
+def _reject_typed_legacy_condition(cls: type[Scorer]) -> None:
     """
     Reject a typed condition on a scorer whose only hooks receive the objective.
 
     Raises:
         LegacyScorerHookError: If the class declares a condition other than ``MatchesObjective``.
     """
-    condition_type = cls.CONDITION_TYPE  # type: ignore[ty:unresolved-attribute]
+    condition_type = cls.CONDITION_TYPE
     if condition_type is not None and condition_type is not MatchesObjective:
         raise LegacyScorerHookError(
             f"{cls.__name__} declares {condition_type.__name__}, which the legacy objective-only "
@@ -126,6 +126,17 @@ def _reject_typed_legacy_condition(cls: type) -> None:
             "implement _score_piece_with_expectation_async. Legacy hooks support objective-based "
             "scoring only, until 2.0."
         )
+
+
+def _legacy_evidence_capabilities(self: Scorer) -> ScorerCapabilities:
+    """
+    Describe the validator that a pre-2.0 subclass passed to ``Scorer``, when it passed one.
+
+    Returns:
+        ScorerCapabilities: The validator's piece filter, or no filter.
+    """
+    validator: ScorerPromptValidator | None = getattr(self, "_validator", None)
+    return ScorerCapabilities() if validator is None else ScorerCapabilities.from_validator(validator)
 
 
 def _adapt_legacy_message_scorer(cls: type) -> None:
@@ -136,35 +147,28 @@ def _adapt_legacy_message_scorer(cls: type) -> None:
     predates the split implements ``_score_async`` or only ``_score_piece_async`` instead, and
     would otherwise fail to instantiate because ``_score_scorable_async`` is abstract.
     ``ABCMeta`` recomputes ``__abstractmethods__`` after ``__init_subclass__``, so assigning
-    here is enough.
-
-    Raises:
-        LegacyScorerHookError: If the class declares a typed condition the legacy hooks cannot receive.
+    here is enough. The adapted scorer reads message evidence, so it also reports the message
+    scorable types and its validator's piece filter, unless it declares its own.
     """
     for base in cls.__mro__:
         if base is Scorer:
             break
-        hook = base.__dict__.get("_score_scorable_async")
-        if hook is None:
-            continue
-        if hook is _legacy_score_scorable_async:
-            # An adapted ancestor still routes through the objective-only hooks.
-            _reject_typed_legacy_condition(cls)
-        return
+        if "_score_scorable_async" in base.__dict__:
+            return
 
     def defines(name: str) -> bool:
         return any(name in base.__dict__ for base in cls.__mro__)
 
     if not defines("_score_async") and not defines("_score_piece_async"):
         return
-    _reject_typed_legacy_condition(cls)
+
+    from pyrit.score.message_scorer import MessageScorer
 
     if not defines("_score_async"):
         # A leaf that only fans in at the piece level used to inherit the message pipeline
         # from its family base. That pipeline now lives on the message-capable family,
         # so lend the matching family implementation here.
         from pyrit.score.float_scale.float_scale_scorer import FloatScaleScorer, MessageFloatScaleScorer
-        from pyrit.score.message_scorer import MessageScorer
         from pyrit.score.true_false.true_false_scorer import MessageTrueFalseScorer, TrueFalseScorer
 
         if issubclass(cls, TrueFalseScorer):
@@ -180,6 +184,10 @@ def _adapt_legacy_message_scorer(cls: type) -> None:
         if not defines("_get_supported_pieces"):
             cls._get_supported_pieces = MessageScorer._get_supported_pieces  # type: ignore[ty:invalid-assignment, ty:unresolved-attribute]
 
+    if not cls.SUPPORTED_SCORABLE_TYPES:  # type: ignore[ty:unresolved-attribute]
+        cls.SUPPORTED_SCORABLE_TYPES = MessageScorer.SUPPORTED_SCORABLE_TYPES  # type: ignore[ty:unresolved-attribute]
+    if cls._get_evidence_capabilities is Scorer._get_evidence_capabilities:  # type: ignore[ty:unresolved-attribute]
+        cls._get_evidence_capabilities = _legacy_evidence_capabilities  # type: ignore[ty:invalid-assignment, ty:unresolved-attribute]
     cls._score_scorable_async = _legacy_score_scorable_async  # type: ignore[ty:invalid-assignment, ty:unresolved-attribute]
 
 
@@ -250,7 +258,13 @@ class Scorer(Identifiable, abc.ABC):
                 removed in 1.4.0. Does not store a target or create a judge.
             validator (ScorerPromptValidator | None): Deprecated. Message validation moved to
                 ``MessageScorer``; a value passed here is kept so pre-2.0 subclasses keep working.
+
+        Raises:
+            LegacyScorerHookError: If a pre-2.0 subclass declares a typed condition that its
+                objective-only hooks cannot receive.
         """
+        if type(self)._score_scorable_async is _legacy_score_scorable_async:
+            _reject_typed_legacy_condition(type(self))
         if validator is not None:
             print_deprecation_message(
                 old_item="Scorer.__init__(validator=...)",
@@ -286,23 +300,29 @@ class Scorer(Identifiable, abc.ABC):
     @final
     def capabilities(self) -> ScorerCapabilities:
         """
-        The evidence and criterion this scorer accepts.
+        The evidence and criteria this scorer accepts.
 
-        The condition is always the derived ``condition_type``, so it cannot disagree with the
-        criterion the scorer retrieves. A wrapper reports no condition of its own; its coverage
-        is ``get_condition_types()``.
+        Condition and scorable coverage come from ``get_condition_types()`` and
+        ``get_supported_scorable_types()``, so they cannot disagree with shared validation.
+        The message fields describe the piece filter that this scorer applies itself.
 
         Returns:
-            ScorerCapabilities: The declared evidence and condition support.
+            ScorerCapabilities: The derived coverage and the scorer's own piece filter.
         """
-        return replace(self._get_evidence_capabilities(), condition_type=self.condition_type)
+        return replace(
+            self._get_evidence_capabilities(),
+            condition_types=self.get_condition_types(),
+            scorable_types=self.get_supported_scorable_types(),
+        )
 
     def _get_evidence_capabilities(self) -> ScorerCapabilities:
         """
-        Describe the evidence this scorer reads; the condition is filled in by ``capabilities``.
+        Describe the piece filter this scorer applies to the message it scores.
+
+        ``capabilities`` replaces the condition and scorable coverage with derived values.
 
         Returns:
-            ScorerCapabilities: No message evidence by default.
+            ScorerCapabilities: No piece filter by default.
         """
         return ScorerCapabilities()
 
@@ -555,6 +575,7 @@ class Scorer(Identifiable, abc.ABC):
             TypeError: If this scorer does not support this kind of scorable.
             ValueError: If conditions are unsupported, missing, or duplicated.
             PyritException: If scoring raises a PyRIT exception (re-raised with enhanced context).
+            LegacyScorerHookError: If a legacy hook cannot receive the typed criteria.
             RuntimeError: If scoring raises a non-PyRIT exception (wrapped with scorer context).
         """
         expectation = self.prepare_expectation(expectation=expectation)
@@ -565,6 +586,8 @@ class Scorer(Identifiable, abc.ABC):
             except PyritException as e:
                 e.message = f"Error in scorer {self.__class__.__name__}: {e.message}"
                 e.args = (f"Status Code: {e.status_code}, Message: {e.message}",)
+                raise
+            except LegacyScorerHookError:
                 raise
             except Exception as e:
                 raise RuntimeError(f"Error in scorer {self.__class__.__name__}: {str(e)}") from e

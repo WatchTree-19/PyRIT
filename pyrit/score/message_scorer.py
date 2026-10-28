@@ -10,7 +10,7 @@ import uuid
 from abc import abstractmethod
 from contextlib import nullcontext
 from dataclasses import replace
-from typing import TYPE_CHECKING, Any, ClassVar, TypeVar, cast
+from typing import TYPE_CHECKING, ClassVar, cast
 
 from pyrit.common.deprecation import print_deprecation_message
 from pyrit.common.task_utils import gather_with_cleanup_async
@@ -56,7 +56,7 @@ from pyrit.score.scorer import LEGACY_SCORE_ASYNC_REMOVED_IN, Scorer
 from pyrit.score.scorer_capabilities import LegacyScorerHookError, ScorerCapabilities
 
 if TYPE_CHECKING:
-    from collections.abc import Callable, Sequence
+    from collections.abc import Sequence
 
     from pyrit.memory import MemoryInterface
     from pyrit.prompt_target import PromptTarget
@@ -64,8 +64,6 @@ if TYPE_CHECKING:
     from pyrit.score.scorer_prompt_validator import ScorerPromptValidator
 
 logger = logging.getLogger(__name__)
-
-_F = TypeVar("_F", bound="Callable[..., Any]")
 
 #: Release in which the message-shaped batch API is removed, two minor releases out.
 MESSAGE_BATCH_REMOVED_IN = "1.3.0"
@@ -293,17 +291,6 @@ _PIPELINE_HOOKS = (
 )
 
 
-def _fans_out_to_piece_hooks(function: _F) -> _F:
-    """
-    Mark a message-family ``_score_async`` that scores through the piece hooks.
-
-    Returns:
-        _F: The same function, marked.
-    """
-    function._fans_out_to_piece_hooks = True  # type: ignore[attr-defined, ty:unresolved-attribute]
-    return function
-
-
 class MessageScorer(Scorer):
     """
     Base class for scorers whose evidence is a single message.
@@ -401,15 +388,17 @@ class MessageScorer(Scorer):
 
     def _check_typed_condition_reaches_hook(self) -> None:
         """
-        Require a declared typed condition to reach an expectation-aware hook.
+        Reject incompatible legacy hooks on the standard message pipeline.
 
-        Legacy hooks receive only the objective. A leaf that declares a typed condition but
-        scores through one would otherwise construct and then fail on every call, so the
-        migration error is raised here instead.
+        Custom pipeline hooks may evaluate the expectation themselves, so their dispatch
+        cannot be inferred here. Runtime guards still reject typed criteria that reach a
+        legacy hook through such a pipeline.
 
         Raises:
             LegacyScorerHookError: If the declared condition can only reach a legacy hook.
         """
+        from pyrit.score.true_false.true_false_scorer import MessageTrueFalseScorer
+
         condition_type = type(self).CONDITION_TYPE
         if condition_type is None or condition_type is MatchesObjective:
             return
@@ -418,9 +407,10 @@ class MessageScorer(Scorer):
         if any(name in base.__dict__ for base in own_bases for name in _PIPELINE_HOOKS):
             return
         score_async = type(self)._score_async
+        score_async_owner = next(base for base in mro if "_score_async" in base.__dict__)
         if "expectation" not in inspect.signature(score_async).parameters:
             replacement = "_score_async(..., expectation=...)"
-        elif getattr(score_async, "_fans_out_to_piece_hooks", False) and not any(
+        elif score_async_owner in (MessageScorer, MessageTrueFalseScorer) and not any(
             "_score_piece_with_expectation_async" in base.__dict__ for base in own_bases
         ):
             replacement = "_score_piece_with_expectation_async"
@@ -439,11 +429,7 @@ class MessageScorer(Scorer):
         Returns:
             ScorerCapabilities: The supported data types, roles, and required metadata.
         """
-        return ScorerCapabilities(
-            supported_data_types=frozenset(self._validator.supported_data_types),
-            supported_roles=frozenset(self._validator.supported_roles),
-            required_metadata=frozenset(self._validator.required_metadata),
-        )
+        return ScorerCapabilities.from_validator(self._validator)
 
     def _get_condition_type(self) -> type[Condition] | None:
         """Return the declared criterion, using the objective validator only for undeclared leaves."""
@@ -1055,6 +1041,7 @@ class MessageScorer(Scorer):
             ScorerLLMResponseBlockedException: If the scorer's own LLM response is blocked by
                 content filtering and ``raise_if_scorer_blocks`` is True (the default).
             PyritException: If scoring raises a PyRIT exception (re-raised with enhanced context).
+            LegacyScorerHookError: If a legacy hook cannot receive the typed criteria.
             RuntimeError: If scoring raises a non-PyRIT exception (wrapped with scorer context).
         """
         objective = expectation.objective if expectation else None
@@ -1126,6 +1113,8 @@ class MessageScorer(Scorer):
             # Re-raise PyRIT exceptions with enhanced context while preserving type for retry decorators
             e.message = f"Error in scorer {self.__class__.__name__}: {e.message}"
             e.args = (f"Status Code: {e.status_code}, Message: {e.message}",)
+            raise
+        except LegacyScorerHookError:
             raise
         except Exception as e:
             # Wrap non-PyRIT exceptions for better error tracing
@@ -1334,7 +1323,6 @@ class MessageScorer(Scorer):
         """
         raise NonReplayableObservationError(f"{type(self).__name__} does not implement judgment observation replay.")
 
-    @_fans_out_to_piece_hooks
     async def _score_async(
         self, message: Message, *, objective: str | None = None, expectation: ScoringExpectation | None = None
     ) -> list[Score]:

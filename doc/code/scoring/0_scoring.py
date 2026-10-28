@@ -125,12 +125,21 @@ print(df.to_string(index=False))
 # `_score_piece_with_expectation_async`, and forward the complete expectation. PyRIT does not
 # silently bypass the old override or infer how to combine both hooks. Legacy hooks on unmigrated
 # leaves still work for objective-only calls until 2.0. A leaf that declares any other typed
-# `CONDITION_TYPE` but implements only a legacy hook raises `LegacyScorerHookError` at
-# construction (at class definition for a direct `Scorer` subclass), because that hook cannot
-# receive the criterion.
+# `CONDITION_TYPE` but uses the standard pipeline with only a legacy hook raises
+# `LegacyScorerHookError` at construction, including direct `Scorer` subclasses. Custom pipeline
+# overrides can evaluate the expectation themselves. If they forward typed criteria to a legacy
+# hook, the runtime guard raises the same error without wrapping it.
 #
-# `Scorer.capabilities` reports the declared condition and the evidence a scorer accepts, so
-# configuration code can check a scorer before acquiring evidence.
+# `Scorer.capabilities` reports derived `condition_types` and `scorable_types`, including wrapper
+# coverage. Its message fields describe the scorer's own piece filter, not child filters.
+# `None` means no filter of that kind is reported; use `scorable_types` to check evidence support.
+# Conversation rendering reports its role filter but does not filter trigger data types or metadata.
+# Piece limits and error policy stay on the validator.
+#
+# `is_objective_required=True` infers `MatchesObjective` only for an undeclared message scorer.
+# An explicit `CONDITION_TYPE` takes precedence. The scorer validates objective requirements before
+# acquiring evidence. `SelfAskGeneralFloatScaleScorer` requires an objective by default, but a custom
+# validator can select a fixed rubric without that requirement.
 #
 # Generic family scorers consume a `Scorable` without assuming that it resolves to a
 # message. Message scorers also support message-specific entry points and policy. Generic

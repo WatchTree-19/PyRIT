@@ -9,7 +9,8 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
-    from pyrit.models import ChatMessageRole, Condition, PromptDataType
+    from pyrit.models import ChatMessageRole, Condition, PromptDataType, Scorable
+    from pyrit.score.scorer_prompt_validator import ScorerPromptValidator
 
 
 class LegacyScorerHookError(TypeError):
@@ -25,25 +26,43 @@ class LegacyScorerHookError(TypeError):
 @dataclass(frozen=True, kw_only=True)
 class ScorerCapabilities:
     """
-    The evidence and criterion a scorer accepts.
+    The evidence and criteria a scorer accepts.
 
     Capabilities decide whether a scorer applies, never how an applicable input fails: piece
-    limits and error policy stay on the message validator. A scorer that does not apply to
-    some evidence returns no score for it, so configuration and preflight checks can compare
-    these fields with the evidence and criteria they intend to supply.
+    limits and error policy stay on the message validator. Condition and scorable coverage are
+    derived from the whole scorer tree. The message fields describe only the filter that this
+    scorer applies to the pieces of the message it scores. A wrapper applies no filter of its
+    own, because each child filters its own evidence.
 
     Attributes:
-        condition_type (type[Condition] | None): The one condition a leaf matches, or None for
-            a wrapper or a criterion fixed at construction. A wrapper's coverage is
-            ``Scorer.get_condition_types()``.
+        condition_types (frozenset[type[Condition]]): The conditions the scorer tree covers.
+        scorable_types (frozenset[type[Scorable]]): The evidence references the scorer accepts.
         supported_data_types (frozenset[PromptDataType] | None): Message piece data types the
-            scorer reads, or None when it does not score message pieces.
+            scorer reads, or None when it applies no data-type filter of its own.
         supported_roles (frozenset[ChatMessageRole] | None): Message roles the scorer reads, or
-            None when it does not score message pieces.
-        required_metadata (frozenset[str]): Metadata keys a message piece must carry.
+            None when it applies no role filter of its own.
+        required_metadata (frozenset[str]): Metadata keys a scored message piece must carry.
     """
 
-    condition_type: type[Condition] | None = None
+    condition_types: frozenset[type[Condition]] = frozenset()
+    scorable_types: frozenset[type[Scorable]] = frozenset()
     supported_data_types: frozenset[PromptDataType] | None = None
     supported_roles: frozenset[ChatMessageRole] | None = None
     required_metadata: frozenset[str] = frozenset()
+
+    @classmethod
+    def from_validator(cls, validator: ScorerPromptValidator) -> ScorerCapabilities:
+        """
+        Describe the piece filter of a message validator.
+
+        Args:
+            validator (ScorerPromptValidator): The validator that filters the scored pieces.
+
+        Returns:
+            ScorerCapabilities: The validator's data types, roles, and required metadata.
+        """
+        return cls(
+            supported_data_types=frozenset(validator.supported_data_types),
+            supported_roles=frozenset(validator.supported_roles),
+            required_metadata=frozenset(validator.required_metadata),
+        )
