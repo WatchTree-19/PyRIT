@@ -149,6 +149,32 @@ async def test_failed_startup_keeps_liveness_and_configuration_recovery_async(ru
     assert saved_configuration.status_code == 200
 
 
+async def test_management_configures_scenario_suite_storage_source_async(tmp_path: Path) -> None:
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text("memory_db_type: in_memory\n", encoding="utf-8")
+    source = ConfigurationFileService(config_file_value=str(config_path))
+    lifecycle = RuntimeLifecycle(app=FastAPI(), source=source)
+    suite_source = str(tmp_path / "scenario_suites")
+    config = ConfigurationLoader(
+        memory_db_type="in_memory",
+        env_files=[],
+        scenario_suites_source=suite_source,
+    )
+    initializer_registry = MagicMock()
+    preset_registry = MagicMock()
+    suite_registry = MagicMock()
+
+    with (
+        patch.object(lifecycle_module.InitializerRegistry, "get_registry_singleton", return_value=initializer_registry),
+        patch.object(lifecycle_module.ScenarioPresetRegistry, "get_registry_singleton", return_value=preset_registry),
+        patch.object(lifecycle_module.ScenarioSuiteRegistry, "get_registry_singleton", return_value=suite_registry),
+    ):
+        await lifecycle._management_async(config)
+
+    suite_registry.configure_source.assert_called_once_with(suite_source)
+    suite_registry.scan_stored_suites.assert_called_once_with()
+
+
 @pytest.mark.parametrize(
     "failures", [(), ("scenarios",), ("services",), ("memory",), ("scenarios", "services", "memory")]
 )
@@ -169,6 +195,8 @@ async def test_shutdown_disposes_memory_after_services_even_on_failure(
         order.attach_mock(memory.dispose_engine_async, "memory")
         errors = tuple(asyncio.CancelledError(name) if cancelled else RuntimeError(name) for name in failures)
         for name, error in zip(failures, errors, strict=True):
+            if name in {"scenarios", "memory"}:
+                error.add_note(f"Existing {name} note.")
             getattr(order, name).side_effect = error
         if len(errors) == 1:
             with pytest.raises(type(errors[0])) as single_error:
@@ -182,6 +210,13 @@ async def test_shutdown_disposes_memory_after_services_even_on_failure(
             await runtime.shutdown_async()
 
     assert order.mock_calls == [call.scenarios(), call.services(), call.memory()]
+    expected_notes = {
+        "scenarios": "Runtime shutdown phase: scenario service shutdown.",
+        "memory": "Runtime shutdown phase: memory disposal.",
+    }
+    for name, error in zip(failures, errors, strict=True):
+        expected = [f"Existing {name} note.", expected_notes[name]] if name in expected_notes else None
+        assert getattr(error, "__notes__", None) == expected
 
 
 async def test_shutdown_repeated_failure_preserves_original_error_async(runtime: RuntimeLifecycle) -> None:
@@ -278,6 +313,18 @@ async def test_active_work_rejects_apply_without_stopping_or_mutating(runtime: R
     assert runtime.state == "ready"
     lifecycle_module.close_services_async.assert_not_awaited()
     assert not hasattr(service, "request_stop") or not service.request_stop.called
+
+
+async def test_active_suite_submission_rejects_apply_without_mutating(runtime: RuntimeLifecycle) -> None:
+    """Test process-local suite coordination participates in the idle barrier."""
+    service = MagicMock()
+    service.has_active_work.return_value = True
+    with patch.object(lifecycle_module, "peek_scenario_suite_execution_service", return_value=service):
+        await apply_async(runtime)
+
+    assert runtime.outcome == "busy"
+    assert runtime.state == "ready"
+    lifecycle_module.close_services_async.assert_not_awaited()
 
 
 @pytest.mark.parametrize("count", [1, 3])

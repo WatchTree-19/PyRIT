@@ -25,7 +25,7 @@ _T = TypeVar("_T")
 def _get_rate_limit_lock(target: Any) -> asyncio.Lock:
     """Return the target's pacing lock, rebuilding it when the event loop changes."""
     loop = asyncio.get_running_loop()
-    target_vars = vars(target)
+    target_vars = vars(getattr(target, "_rate_limit_source", target))
     lock = target_vars.get("_rate_limit_lock")
     if lock is None or target_vars.get("_rate_limit_lock_loop") is not loop:
         lock = asyncio.Lock()
@@ -61,6 +61,34 @@ def validate_top_p(top_p: float | None) -> None:
     """
     if top_p is not None and (top_p < 0 or top_p > 1):
         raise PyritException(message="top_p must be between 0 and 1 (inclusive).")
+
+
+def validate_presence_penalty(presence_penalty: float | None) -> None:
+    """
+    Validate an optional presence penalty is finite and within [-2, 2].
+
+    Args:
+        presence_penalty (float | None): The presence penalty to validate, or None to leave it unset.
+
+    Raises:
+        PyritException: If the value is non-finite or outside [-2, 2].
+    """
+    if presence_penalty is not None and not -2 <= presence_penalty <= 2:
+        raise PyritException(message="presence_penalty must be between -2 and 2 (inclusive).")
+
+
+def validate_frequency_penalty(frequency_penalty: float | None) -> None:
+    """
+    Validate an optional frequency penalty is finite and within [-2, 2].
+
+    Args:
+        frequency_penalty (float | None): The frequency penalty to validate, or None to leave it unset.
+
+    Raises:
+        PyritException: If the value is non-finite or outside [-2, 2].
+    """
+    if frequency_penalty is not None and not -2 <= frequency_penalty <= 2:
+        raise PyritException(message="frequency_penalty must be between -2 and 2 (inclusive).")
 
 
 def limit_requests_per_minute(
