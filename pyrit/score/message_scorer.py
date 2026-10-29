@@ -52,8 +52,7 @@ from pyrit.score.observation.execution import (
     _scoring_scorable_context,
     _suppress_observation_collection,
 )
-from pyrit.score.scorer import LEGACY_SCORE_ASYNC_REMOVED_IN, Scorer
-from pyrit.score.scorer_capabilities import LegacyScorerHookError, ScorerCapabilities
+from pyrit.score.scorer import LEGACY_SCORE_ASYNC_REMOVED_IN, LegacyScorerHookError, Scorer
 
 if TYPE_CHECKING:
     from collections.abc import Sequence
@@ -421,15 +420,6 @@ class MessageScorer(Scorer):
             f"hook cannot receive. Implement {replacement}. Legacy hooks support objective-based "
             "scoring only, until 2.0."
         )
-
-    def _get_evidence_capabilities(self) -> ScorerCapabilities:
-        """
-        Describe the message evidence this scorer reads, from its validator.
-
-        Returns:
-            ScorerCapabilities: The supported data types, roles, and required metadata.
-        """
-        return ScorerCapabilities.from_validator(self._validator)
 
     def _get_condition_type(self) -> type[Condition] | None:
         """Return the declared criterion, using the objective validator only for undeclared leaves."""

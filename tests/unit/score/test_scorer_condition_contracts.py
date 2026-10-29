@@ -3,8 +3,7 @@
 
 from __future__ import annotations
 
-import dataclasses
-from typing import Literal, cast
+from typing import Literal
 from unittest.mock import MagicMock
 
 import pytest
@@ -20,38 +19,27 @@ from pyrit.models import (
     MessageScorable,
     ProgramBehaves,
     ProgramExecutionScorable,
-    Scorable,
-    ScorableUnion,
     Score,
     ScoringExpectation,
-    ToolsCalled,
 )
 from pyrit.score import (
     LegacyScorerHookError,
-    ManualScorer,
-    MessageToolCallScorer,
     MessageTrueFalseScorer,
     ProgramExecutionScorer,
-    ScorerCapabilities,
     ScorerPromptValidator,
     SelfAskGeneralFloatScaleScorer,
     SelfAskScaleScorer,
-    TrueFalseCompositeScorer,
-    TrueFalseInverterScorer,
-    TrueFalseScoreAggregator,
     TrueFalseScorer,
-    create_conversation_scorer,
 )
-from pyrit.score.audio_transcript_scorer import AudioTranscriptHelper
 from pyrit.score.float_scale.decision_scorer import DecisionScorer
 from pyrit.score.observation import execution
-from pyrit.score.video_scorer import VideoHelper
+from pyrit.score.observation.observation_source import ObservationSource
 
 pytestmark = pytest.mark.usefixtures("patch_central_database")
 
 
 class _TypedCondition(Condition):
-    condition_type: Literal["test_capabilities_typed"] = "test_capabilities_typed"
+    condition_type: Literal["test_condition_contracts_typed"] = "test_condition_contracts_typed"
     value: str = "typed"
 
 
@@ -99,24 +87,11 @@ class _LegacyPieceScorer(MessageTrueFalseScorer):
         return _score_for(self, message_piece, None)
 
 
-class _GenericScorer(TrueFalseScorer):
-    def _build_identifier(self) -> ComponentIdentifier:
-        return self._create_identifier()
-
-    async def _score_scorable_async(self, *, scorable: Scorable, expectation: ScoringExpectation | None) -> list[Score]:
-        return [
-            Score(
-                score_value="true",
-                score_type="true_false",
-                scorable=cast("ScorableUnion", scorable),
-                scorer_class_identifier=self.get_identifier(),
-            )
-        ]
-
-
 class _LegacyDirectScorer(TrueFalseScorer):
+    """A pre-2.0 direct family subclass that implements only the message hook."""
+
     def __init__(self) -> None:
-        super().__init__(validator=ScorerPromptValidator(supported_data_types=["audio_path"]))
+        super().__init__(validator=ScorerPromptValidator(supported_data_types=["text"]))
 
     def _build_identifier(self) -> ComponentIdentifier:
         return self._create_identifier()
@@ -125,42 +100,14 @@ class _LegacyDirectScorer(TrueFalseScorer):
         return _score_for(self, message.get_piece(), None)
 
 
-class TestCapabilities:
-    def test_message_scorer_reports_validator_evidence_and_condition(self) -> None:
-        validator = ScorerPromptValidator(
-            supported_data_types=["text", "image_path"],
-            supported_roles=["assistant"],
-            required_metadata=["source"],
-        )
-        capabilities = _TypedMessageScorer(validator=validator).capabilities
-
-        assert capabilities == ScorerCapabilities(
-            condition_types=frozenset({_TypedCondition}),
-            scorable_types=frozenset({MessageScorable, ContentScorable, ContentEntryScorable}),
-            supported_data_types=frozenset({"text", "image_path"}),
-            supported_roles=frozenset({"assistant"}),
-            required_metadata=frozenset({"source"}),
-        )
-
-    def test_capabilities_are_frozen(self) -> None:
-        capabilities = _TypedMessageScorer().capabilities
-        with pytest.raises(dataclasses.FrozenInstanceError):
-            capabilities.condition_types = frozenset()  # type: ignore[misc]
-
-    def test_validator_defaults_exclude_simulated_roles(self) -> None:
-        capabilities = _TypedMessageScorer().capabilities
-
-        assert capabilities.supported_roles is not None
-        assert "assistant" in capabilities.supported_roles
-        assert "simulated_assistant" not in capabilities.supported_roles
-        assert capabilities.required_metadata == frozenset()
-
+class TestObjectiveValidatorFlag:
     async def test_class_condition_takes_precedence_over_validator_flag_async(self) -> None:
         scorer = _TypedMessageScorer(validator=ScorerPromptValidator(is_objective_required=True))
-
-        assert scorer.capabilities.condition_types == frozenset({_TypedCondition})
         expectation = ScoringExpectation(conditions=(_TypedCondition(),))
+
         [score] = await scorer.score_async(scorable=ContentScorable(value="hi"), expectation=expectation)
+
+        assert scorer.get_condition_types() == frozenset({_TypedCondition})
         assert score.get_value() is True
         assert score.scored_expectation == expectation
 
@@ -170,85 +117,7 @@ class TestCapabilities:
     ) -> None:
         scorer = _UndeclaredMessageScorer(validator=ScorerPromptValidator(is_objective_required=required))
 
-        assert scorer.capabilities.condition_types == (frozenset({expected}) if expected else frozenset())
-
-    def test_scorer_without_piece_filter_still_reports_message_support(self) -> None:
-        capabilities = ManualScorer(value=True, rationale="checked", user_identifier="reviewer").capabilities
-
-        assert capabilities == ScorerCapabilities(scorable_types=frozenset({MessageScorable}))
-        assert capabilities.supported_data_types is None
-        assert capabilities.supported_roles is None
-
-    def test_wrapper_reports_derived_coverage_without_its_own_piece_filter(self) -> None:
-        wrapper = TrueFalseInverterScorer(scorer=_TypedMessageScorer())
-
-        assert wrapper.condition_type is None
-        assert wrapper.capabilities.condition_types == frozenset({_TypedCondition})
-        assert wrapper.capabilities.scorable_types == _TypedMessageScorer().capabilities.scorable_types
-        assert wrapper.capabilities.supported_data_types is None
-        assert wrapper.get_condition_types() == frozenset({_TypedCondition})
-
-    def test_mixed_tree_reports_common_scorable_types_and_combined_conditions(self) -> None:
-        wrapper = TrueFalseInverterScorer(
-            scorer=TrueFalseCompositeScorer(
-                scorers=[_TypedMessageScorer(), MessageToolCallScorer()],
-                aggregator=TrueFalseScoreAggregator.AND,
-            )
-        )
-        assert wrapper.capabilities.condition_types == frozenset({_TypedCondition, ToolsCalled})
-        assert wrapper.capabilities.scorable_types == frozenset({MessageScorable})
-        assert wrapper.capabilities.supported_roles is None
-
-    def test_conversation_capabilities_do_not_filter_trigger_types_or_metadata(self) -> None:
-        scorer = create_conversation_scorer(
-            scorer=_TypedMessageScorer(),
-            validator=ScorerPromptValidator(
-                supported_data_types=["text"], required_metadata=["unused"], supported_roles=["assistant"]
-            ),
-        )
-        assert scorer.capabilities.scorable_types == scorer.get_supported_scorable_types()
-        assert MessageScorable in scorer.capabilities.scorable_types
-        assert scorer.capabilities.supported_data_types is None
-        assert scorer.capabilities.required_metadata == frozenset()
-        assert scorer.capabilities.supported_roles == frozenset({"assistant"})
-
-    def test_adapted_legacy_scorer_reports_its_message_evidence(self) -> None:
-        with pytest.warns(DeprecationWarning, match="Scorer.__init__"):
-            scorer = _LegacyDirectScorer()
-        assert scorer.capabilities.scorable_types == _TypedMessageScorer().capabilities.scorable_types
-        assert scorer.capabilities.supported_data_types == frozenset({"audio_path"})
-        VideoHelper._validate_audio_scorer(scorer)
-
-    def test_program_scorer_reports_code_and_execution_evidence(self) -> None:
-        from pyrit.score.observation.observation_source import ObservationSource
-
-        scorer = ProgramExecutionScorer(source=MagicMock(spec=ObservationSource))
-        assert scorer.capabilities.condition_types == frozenset({ProgramBehaves})
-        assert scorer.capabilities.scorable_types == frozenset(
-            {MessageScorable, ContentScorable, ContentEntryScorable, ProgramExecutionScorable}
-        )
-        assert scorer.capabilities.supported_data_types is None
-
-    def test_capabilities_cannot_be_overridden(self) -> None:
-        with pytest.raises(TypeError, match="cannot override derived condition capabilities"):
-            type("InvalidScorer", (_TypedMessageScorer,), {"capabilities": ScorerCapabilities()})
-
-    def test_evidence_hook_cannot_replace_derived_coverage(self) -> None:
-        class CustomEvidenceScorer(_GenericScorer):
-            CONDITION_TYPE = _TypedCondition
-
-            def _get_evidence_capabilities(self) -> ScorerCapabilities:
-                return ScorerCapabilities(
-                    condition_types=frozenset({MatchesObjective}),
-                    scorable_types=frozenset({MessageScorable}),
-                    required_metadata=frozenset({"trace"}),
-                )
-
-        capabilities = CustomEvidenceScorer().capabilities
-
-        assert capabilities.condition_types == frozenset({_TypedCondition})
-        assert capabilities.scorable_types == frozenset()
-        assert capabilities.required_metadata == frozenset({"trace"})
+        assert scorer.condition_type is expected
 
 
 class TestObjectiveScorersDeclareMatchesObjective:
@@ -265,7 +134,7 @@ class TestObjectiveScorersDeclareMatchesObjective:
             validator=ScorerPromptValidator(supported_data_types=["text", "image_path"]),
         )
 
-        assert scorer.capabilities.condition_types == frozenset({MatchesObjective})
+        assert scorer.condition_type is MatchesObjective
         with pytest.raises(ValueError, match="MatchesObjective requires the expectation to carry an objective"):
             scorer._validate_expectation(expectation=None)
 
@@ -278,12 +147,28 @@ class TestObjectiveScorersDeclareMatchesObjective:
             validator=ScorerPromptValidator(supported_data_types=["text"]) if configured_rubric else None,
         )
         if configured_rubric:
-            assert scorer.capabilities.condition_types == frozenset()
+            assert scorer.get_condition_types() == frozenset()
             scorer.prepare_expectation(expectation=None)
         else:
-            assert scorer.capabilities.condition_types == frozenset({MatchesObjective})
+            assert scorer.get_condition_types() == frozenset({MatchesObjective})
             with pytest.raises(ValueError, match="MatchesObjective requires"):
                 scorer.prepare_expectation(expectation=None)
+
+
+class TestScorableTypeDeclarations:
+    def test_adapted_legacy_scorer_declares_message_evidence(self) -> None:
+        with pytest.warns(DeprecationWarning, match="Scorer.__init__"):
+            scorer = _LegacyDirectScorer()
+
+        assert scorer.get_supported_scorable_types() == _TypedMessageScorer().get_supported_scorable_types()
+
+    def test_program_scorer_declares_code_and_execution_evidence(self) -> None:
+        scorer = ProgramExecutionScorer(source=MagicMock(spec=ObservationSource))
+
+        assert scorer.get_supported_scorable_types() == frozenset(
+            {MessageScorable, ContentScorable, ContentEntryScorable, ProgramExecutionScorable}
+        )
+        assert scorer.get_condition_types() == frozenset({ProgramBehaves})
 
 
 class TestNoAmbientExpectation:
@@ -385,23 +270,3 @@ class TestLegacyHookConstruction:
             expectation=ScoringExpectation(conditions=(_TypedCondition(),)),
         )
         assert score.get_value() is True
-
-
-class TestModalityPreflight:
-    def test_video_audio_scorer_without_message_evidence_is_rejected(self) -> None:
-        with pytest.raises(ValueError, match=r"supports 'audio_path' data type\. Supported types: none reported"):
-            VideoHelper._validate_audio_scorer(_GenericScorer())
-
-    def test_video_audio_scorer_without_audio_is_rejected(self) -> None:
-        scorer = _TypedMessageScorer(validator=ScorerPromptValidator(supported_data_types=["text"]))
-        with pytest.raises(ValueError, match=r"Supported types: \['text'\]"):
-            VideoHelper._validate_audio_scorer(scorer)
-
-    def test_video_audio_scorer_with_audio_is_accepted(self) -> None:
-        scorer = _TypedMessageScorer(validator=ScorerPromptValidator(supported_data_types=["audio_path"]))
-        VideoHelper._validate_audio_scorer(scorer)
-
-    def test_audio_text_scorer_without_text_is_rejected(self) -> None:
-        scorer = _TypedMessageScorer(validator=ScorerPromptValidator(supported_data_types=["image_path"]))
-        with pytest.raises(ValueError, match=r"supports 'text' data type\. Supported types: \['image_path'\]"):
-            AudioTranscriptHelper._validate_text_scorer(scorer)

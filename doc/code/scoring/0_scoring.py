@@ -130,12 +130,6 @@ print(df.to_string(index=False))
 # overrides can evaluate the expectation themselves. If they forward typed criteria to a legacy
 # hook, the runtime guard raises the same error without wrapping it.
 #
-# `Scorer.capabilities` reports derived `condition_types` and `scorable_types`, including wrapper
-# coverage. Its message fields describe the scorer's own piece filter, not child filters.
-# `None` means no filter of that kind is reported; use `scorable_types` to check evidence support.
-# Conversation rendering reports its role filter but does not filter trigger data types or metadata.
-# Piece limits and error policy stay on the validator.
-#
 # `is_objective_required=True` infers `MatchesObjective` only for an undeclared message scorer.
 # An explicit `CONDITION_TYPE` takes precedence. The scorer validates objective requirements before
 # acquiring evidence. `SelfAskGeneralFloatScaleScorer` requires an objective by default, but a custom

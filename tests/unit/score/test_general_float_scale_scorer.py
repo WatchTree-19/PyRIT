@@ -73,7 +73,7 @@ async def test_general_float_scorer_fixed_rubric_without_objective_async(
     assert score.get_value() == 0.75
     assert score.score_category == ["test_category"]
     assert score.objective is None
-    assert scorer.capabilities.condition_types == frozenset()
+    assert scorer.get_condition_types() == frozenset()
     chat_target.send_prompt_async.assert_awaited_once()
 
 

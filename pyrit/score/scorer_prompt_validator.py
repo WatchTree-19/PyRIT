@@ -57,7 +57,6 @@ class ScorerPromptValidator:
             is_objective_required (bool): Infer ``MatchesObjective`` on an undeclared message scorer.
                 The scorer validates that condition before acquiring evidence. Defaults to False.
         """
-        self._supported_data_types: Sequence[PromptDataType]
         if supported_data_types:
             self._supported_data_types = supported_data_types
         else:
@@ -68,7 +67,7 @@ class ScorerPromptValidator:
         else:
             self._supported_roles = DEFAULT_SUPPORTED_ROLES
 
-        self._required_metadata: Sequence[str] = required_metadata or []
+        self._required_metadata = required_metadata or []
 
         self._max_pieces_in_response = max_pieces_in_response
         self._max_text_length = max_text_length
@@ -86,21 +85,6 @@ class ScorerPromptValidator:
         configured instance of an undeclared scorer require ``MatchesObjective``.
         """
         return self._is_objective_required
-
-    @property
-    def supported_data_types(self) -> tuple[PromptDataType, ...]:
-        """The message piece data types this validator accepts."""
-        return tuple(self._supported_data_types)
-
-    @property
-    def supported_roles(self) -> tuple[ChatMessageRole, ...]:
-        """The message roles this validator accepts."""
-        return tuple(self._supported_roles)
-
-    @property
-    def required_metadata(self) -> tuple[str, ...]:
-        """The metadata keys every accepted message piece must carry."""
-        return tuple(self._required_metadata)
 
     def validate(self, message: Message, objective: str | None) -> None:
         """

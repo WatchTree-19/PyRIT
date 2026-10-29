@@ -24,7 +24,6 @@ from pyrit.score.observation.conversation_source import ConversationSource
 from pyrit.score.observation.execution import _collect_observation, _ObservationEvidenceResolver
 from pyrit.score.observation.observation_source import ObservationSource
 from pyrit.score.scorer import Scorer
-from pyrit.score.scorer_capabilities import ScorerCapabilities
 from pyrit.score.scorer_prompt_validator import ScorerPromptValidator
 from pyrit.score.true_false.true_false_scorer import MessageTrueFalseScorer, TrueFalseScorer
 
@@ -105,18 +104,6 @@ class ConversationScorer(MessageScorer, ABC):
     def _get_child_scorers(self) -> tuple[Scorer, ...]:
         """Return the scorer that evaluates the conversation text."""
         return (self._get_wrapped_scorer(),)
-
-    def _get_evidence_capabilities(self) -> ScorerCapabilities:
-        """
-        Describe the role filter applied to retained conversation turns.
-
-        Trigger messages have no piece filter. Conversation rendering checks roles, but
-        does not apply the validator's data types or metadata requirements.
-
-        Returns:
-            ScorerCapabilities: The conversation role filter only.
-        """
-        return ScorerCapabilities(supported_roles=frozenset(self._validator.supported_roles))
 
     def _build_scoring_message(self, *, message: Message) -> Message | None:
         """

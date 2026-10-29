@@ -64,12 +64,6 @@ Requirements:
   only its supported subset, preserving objective context. Shared validation checks every child
   before scoring. Wrappers that transform context expose the same inputs through
   `_get_child_expectations()` for preflight.
-- `Scorer.capabilities` is final. Its `condition_types` and `scorable_types` come from
-  `get_condition_types()` and `get_supported_scorable_types()`, including wrapper coverage.
-  Override `_get_evidence_capabilities()` only for the scorer's own message-piece filter.
-  Message scorers derive it from their validator; `None` means no filter of that kind is
-  reported, not that message evidence is unsupported. Wrappers do not combine child piece
-  filters, since each child reads its own evidence. Conversation triggers have no piece filter.
 - A class `CONDITION_TYPE` takes precedence over the validator's `is_objective_required`,
   which only lets an undeclared scorer require `MatchesObjective`. The scorer validates that
   condition before evidence acquisition; the validator does not independently require an objective.

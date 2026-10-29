@@ -46,7 +46,6 @@ from pyrit.score.observation.execution import (
     _scoring_message_context,
     _scoring_scorable_context,
 )
-from pyrit.score.scorer_capabilities import LegacyScorerHookError, ScorerCapabilities
 
 if TYPE_CHECKING:
     from collections.abc import Awaitable, Callable, Sequence
@@ -64,6 +63,16 @@ logger = logging.getLogger(__name__)
 #: Release in which the message-shaped ``score_async`` parameters are removed.
 LEGACY_SCORE_ASYNC_REMOVED_IN = "2.0.0"
 ConditionT = TypeVar("ConditionT", bound=Condition)
+
+
+class LegacyScorerHookError(TypeError):
+    """
+    A scorer's protected hook cannot receive the typed criterion the scorer declares.
+
+    Legacy hooks receive only the objective. They keep working for objective-based and
+    constructor-configured scoring until 2.0, but a scorer that declares a typed condition
+    must implement an expectation-aware hook so the criterion reaches the code that matches it.
+    """
 
 
 class _SelfContainedJudgeTargetRequirements(TargetRequirements):
@@ -128,17 +137,6 @@ def _reject_typed_legacy_condition(cls: type[Scorer]) -> None:
         )
 
 
-def _legacy_evidence_capabilities(self: Scorer) -> ScorerCapabilities:
-    """
-    Describe the validator that a pre-2.0 subclass passed to ``Scorer``, when it passed one.
-
-    Returns:
-        ScorerCapabilities: The validator's piece filter, or no filter.
-    """
-    validator: ScorerPromptValidator | None = getattr(self, "_validator", None)
-    return ScorerCapabilities() if validator is None else ScorerCapabilities.from_validator(validator)
-
-
 def _adapt_legacy_message_scorer(cls: type) -> None:
     """
     Give a pre-2.0 direct ``Scorer`` subclass an implementation of the scorable contract.
@@ -147,8 +145,8 @@ def _adapt_legacy_message_scorer(cls: type) -> None:
     predates the split implements ``_score_async`` or only ``_score_piece_async`` instead, and
     would otherwise fail to instantiate because ``_score_scorable_async`` is abstract.
     ``ABCMeta`` recomputes ``__abstractmethods__`` after ``__init_subclass__``, so assigning
-    here is enough. The adapted scorer reads message evidence, so it also reports the message
-    scorable types and its validator's piece filter, unless it declares its own.
+    here is enough. The adapted scorer reads message evidence, so it also declares the message
+    scorable types unless it declares its own.
     """
     for base in cls.__mro__:
         if base is Scorer:
@@ -186,8 +184,6 @@ def _adapt_legacy_message_scorer(cls: type) -> None:
 
     if not cls.SUPPORTED_SCORABLE_TYPES:  # type: ignore[ty:unresolved-attribute]
         cls.SUPPORTED_SCORABLE_TYPES = MessageScorer.SUPPORTED_SCORABLE_TYPES  # type: ignore[ty:unresolved-attribute]
-    if cls._get_evidence_capabilities is Scorer._get_evidence_capabilities:  # type: ignore[ty:unresolved-attribute]
-        cls._get_evidence_capabilities = _legacy_evidence_capabilities  # type: ignore[ty:invalid-assignment, ty:unresolved-attribute]
     cls._score_scorable_async = _legacy_score_scorable_async  # type: ignore[ty:invalid-assignment, ty:unresolved-attribute]
 
 
@@ -235,7 +231,7 @@ class Scorer(Identifiable, abc.ABC):
             for name in ("MATCHED_CONDITIONS", "REQUIRED_CONDITIONS", "matched_conditions", "required_conditions")
         ):
             raise TypeError(f"{cls.__name__} must declare one CONDITION_TYPE, not condition sets.")
-        if any(name in cls.__dict__ for name in ("condition_type", "get_condition_types", "capabilities")):
+        if any(name in cls.__dict__ for name in ("condition_type", "get_condition_types")):
             raise TypeError(f"{cls.__name__} cannot override derived condition capabilities.")
         cls._check_condition_type(cls.CONDITION_TYPE)
         if cls.CONDITION_TYPE is not None and any(
@@ -295,36 +291,6 @@ class Scorer(Identifiable, abc.ABC):
         if condition_type is not None and self._get_child_scorers():
             raise TypeError(f"{type(self).__name__} wraps scorers and cannot declare its own condition type.")
         return condition_type
-
-    @property
-    @final
-    def capabilities(self) -> ScorerCapabilities:
-        """
-        The evidence and criteria this scorer accepts.
-
-        Condition and scorable coverage come from ``get_condition_types()`` and
-        ``get_supported_scorable_types()``, so they cannot disagree with shared validation.
-        The message fields describe the piece filter that this scorer applies itself.
-
-        Returns:
-            ScorerCapabilities: The derived coverage and the scorer's own piece filter.
-        """
-        return replace(
-            self._get_evidence_capabilities(),
-            condition_types=self.get_condition_types(),
-            scorable_types=self.get_supported_scorable_types(),
-        )
-
-    def _get_evidence_capabilities(self) -> ScorerCapabilities:
-        """
-        Describe the piece filter this scorer applies to the message it scores.
-
-        ``capabilities`` replaces the condition and scorable coverage with derived values.
-
-        Returns:
-            ScorerCapabilities: No piece filter by default.
-        """
-        return ScorerCapabilities()
 
     def _get_condition_type(self) -> type[Condition] | None:
         """Return the leaf declaration, or its instance-specific equivalent."""
