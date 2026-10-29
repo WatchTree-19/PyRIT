@@ -54,6 +54,9 @@ from pyrit.backend.models.attacks import (
 )
 from pyrit.backend.models.common import PaginationInfo
 from pyrit.backend.models.message_sends import MessageSendRequest, MessageSendStatus
+from pyrit.backend.services.chat_scoring_service import get_chat_scoring_service
+from pyrit.backend.services.component_lifecycle import release_component_async
+from pyrit.backend.services.history_replay import validate_history_replay
 from pyrit.backend.services.media_persistence import persist_message_pieces_async
 from pyrit.backend.services.message_send_service import (
     MessageSendService,
@@ -66,12 +69,14 @@ from pyrit.backend.services.pagination import (
     fingerprint_filters,
     normalize_label_filters,
 )
+from pyrit.backend.services.saved_conversation_read_service import SavedConversationReadService
 from pyrit.backend.services.target_service import get_target_service
 from pyrit.common.utils import to_sha256
 from pyrit.executor.attack import attack_outcome_from_score
 from pyrit.memory import (
     AttackResultKeysetCursor,
     CentralMemory,
+    MemoryInterface,
     data_serializer_factory,
     set_message_piece_sha256_async,
 )
@@ -88,8 +93,12 @@ from pyrit.models import (
     Message,
     MessagePiece,
     TargetIdentifier,
+    group_conversation_message_pieces_by_sequence,
 )
+from pyrit.models.component_spec import RegisteredComponentReference, TargetBinding
 from pyrit.models.messages.tool_content import validate_tool_conversation
+from pyrit.models.results.attack_result import AttackScoringInputs
+from pyrit.models.target.request_trace_context import RequestTraceContext
 from pyrit.prompt_target import PromptTarget
 
 logger = logging.getLogger(__name__)
@@ -127,9 +136,12 @@ class AttackService:
     Uses PyRIT memory (database) as the source of truth via AttackResult.
     """
 
-    def __init__(self, *, message_send_service: MessageSendService | None = None) -> None:
+    def __init__(
+        self, *, message_send_service: MessageSendService | None = None, memory: MemoryInterface | None = None
+    ) -> None:
         """Initialize the attack service."""
-        self._memory = CentralMemory.get_memory_instance()
+        self._memory = memory if memory is not None else CentralMemory.get_memory_instance()
+        self._saved_conversation_reader = SavedConversationReadService(memory=self._memory)
         self._message_send_service = (
             message_send_service if message_send_service is not None else get_message_send_service()
         )
@@ -306,7 +318,11 @@ class AttackService:
 
             page.append(
                 await attack_result_to_summary_async(
-                    ar, stats=merged, operation_name=operation_names.get(ar.operation_id) if ar.operation_id else None
+                    ar,
+                    stats=merged,
+                    operation_name=operation_names.get(ar.operation_id) if ar.operation_id else None,
+                    scoring_inputs=get_chat_scoring_service().inputs(ar),
+                    execution_read_only=get_chat_scoring_service().execution_read_only(ar),
                 )
             )
 
@@ -357,7 +373,11 @@ class AttackService:
         stats = stats_map.get(ar.conversation_id, ConversationStats(message_count=0))
         operation_names = await self._get_operation_names_async(results=[ar])
         return await attack_result_to_summary_async(
-            ar, stats=stats, operation_name=operation_names.get(ar.operation_id) if ar.operation_id else None
+            ar,
+            stats=stats,
+            operation_name=operation_names.get(ar.operation_id) if ar.operation_id else None,
+            scoring_inputs=get_chat_scoring_service().inputs(ar),
+            execution_read_only=get_chat_scoring_service().execution_read_only(ar),
         )
 
     async def _get_operation_names_async(self, *, results: Sequence[AttackResult]) -> dict[uuid.UUID, str]:
@@ -378,13 +398,17 @@ class AttackService:
         *,
         attack_result_id: str,
         conversation_id: str,
+        limit: int | None = None,
+        cursor: str | None = None,
     ) -> ConversationMessagesResponse | None:
         """
-        Get all messages for a conversation belonging to an attack.
+        Get messages for a main or pruned conversation belonging to an attack.
 
         Args:
             attack_result_id: The AttackResult's primary key (used to verify existence).
             conversation_id: The conversation whose messages to return.
+            limit: Optional message-piece page size. None preserves the existing full-conversation read.
+            cursor: Continuation for an explicitly paged read.
 
         Returns:
             ConversationMessagesResponse if attack found, None otherwise.
@@ -392,6 +416,13 @@ class AttackService:
         Raises:
             ValueError: If the conversation does not belong to the attack.
         """
+        if limit is not None:
+            return await self._saved_conversation_reader.get_messages_async(
+                attack_result_id=attack_result_id, conversation_id=conversation_id, limit=limit, cursor=cursor
+            )
+        if cursor is not None:
+            raise ValueError("A message-page cursor requires a limit.")
+
         # Check attack exists
         results = await self._memory.get_attack_results_async(attack_result_ids=[attack_result_id])
         if not results:
@@ -407,12 +438,23 @@ class AttackService:
         backend_messages = await pyrit_messages_to_dto_async(
             list(pyrit_messages),
             objective_score_id=ar.last_score.id if ar.last_score else None,
+            memory=self._memory,
         )
+        scoring_result = ar.get_scoring_failure(conversation_id)
+        latest_response = next(
+            (message for message in reversed(pyrit_messages) if message.api_role == "assistant"), None
+        )
+        if scoring_result is not None and (
+            latest_response is None
+            or scoring_result.response_id not in {str(piece.id) for piece in latest_response.message_pieces}
+        ):
+            scoring_result = None
 
         return ConversationMessagesResponse(
             conversation_id=conversation_id,
             messages=backend_messages,
             target_response_status=_get_latest_target_response_status(backend_messages),
+            scoring_failure=scoring_result,
         )
 
     async def get_saved_conversation_async(self, *, conversation_id: str) -> AddMessageResponse | None:
@@ -465,7 +507,9 @@ class AttackService:
                 "operation": request.operation if request.operation_id is None else None,
             }
         )
-        target_identifier = await self._get_save_target_async(request.target_registry_name)
+        target_identifier = await self._get_save_target_async(
+            registry_name=request.target_registry_name, binding=request.target_binding
+        )
         copied: Sequence[MessagePiece] = []
         if request.source_conversation_id is not None and request.cutoff_index is not None:
             conversation, copied = await self._prepare_conversation_up_to_async(
@@ -481,6 +525,23 @@ class AttackService:
             objective=request.name or "",
             attack_name=request.name or "ManualAttack",
         )
+        if request.source_conversation_id is not None:
+            source_conversation = await self._memory.get_conversation_metadata_async(
+                conversation_id=str(request.source_conversation_id)
+            )
+            source = (
+                await self._memory.get_attack_results_async(attack_result_ids=[source_conversation.attack_result_id])
+                if source_conversation and source_conversation.attack_result_id
+                else []
+            )
+            if source:
+                get_chat_scoring_service().continue_manually(
+                    source=source[0],
+                    destination=attack_result,
+                    source_conversation_id=str(request.source_conversation_id),
+                    retained_pieces=copied,
+                    explicit_selection="chat_scorer" in request.model_fields_set,
+                )
         prepended = list(request.prepended_conversation or [])
         if request.system_prompt:
             prepended.insert(
@@ -499,6 +560,21 @@ class AttackService:
                 persisted_paths=persisted_paths,
                 start_sequence=max((piece.sequence for piece in copied), default=-1) + 1,
             )
+            if copied or pieces:
+                target_object = await self._validate_editor_target_async(
+                    target_identifier=target_identifier,
+                    registry_name=request.target_registry_name,
+                    binding=request.target_binding,
+                )
+                try:
+                    if target_object:
+                        validate_history_replay(
+                            target=target_object,
+                            messages=group_conversation_message_pieces_by_sequence([*copied, *pieces]),
+                        )
+                finally:
+                    if request.target_binding and target_object:
+                        await release_component_async(target_object)
             task = asyncio.create_task(
                 self._memory.add_conversation_branches_to_attack_async(
                     attack_result_id=attack_result.attack_result_id,
@@ -562,6 +638,12 @@ class AttackService:
                 "created_at": now.isoformat(),
                 "target_unbound": conversation.target_identifier is None,
                 **({"target_registry_name": request.target_registry_name} if request.target_registry_name else {}),
+                **(request.target_binding.to_metadata() if request.target_binding else {}),
+                **(
+                    AttackScoringInputs(scorer=request.chat_scorer, revision=str(uuid.uuid4())).to_metadata()
+                    if "chat_scorer" in request.model_fields_set
+                    else {}
+                ),
             },
         )
 
@@ -578,7 +660,10 @@ class AttackService:
         if not results:
             return None
 
+        if request.objective is not None or "chat_scorer" in request.model_fields_set:
+            get_chat_scoring_service().require_manual(results[0])
         update_fields: dict[str, Any] = {"timestamp": datetime.now(UTC)}
+        expected_fields: dict[str, Any] = {"objective": results[0].objective}
         if request.outcome is not None:
             outcome_map = {
                 "undetermined": AttackOutcome.UNDETERMINED,
@@ -591,10 +676,31 @@ class AttackService:
             existing_objective = results[0].objective
             if request.expected_objective is not None and existing_objective != request.expected_objective:
                 raise AttackObjectiveConflictError("The objective changed. Reload before saving.")
-            if existing_objective == request.objective and request.outcome is None:
+            if (
+                existing_objective == request.objective
+                and request.outcome is None
+                and "chat_scorer" not in request.model_fields_set
+            ):
                 return await self.get_attack_async(attack_result_id=attack_result_id)
-            update_fields.update(self._objective_update_fields(old=existing_objective, new=request.objective))
-        if request.objective is None:
+            update_fields.update(
+                self._objective_update_fields(
+                    attack=results[0],
+                    new=request.objective,
+                    default_scorer=request.default_chat_scorer
+                    if "chat_scorer" not in request.model_fields_set
+                    else None,
+                )
+            )
+        if "chat_scorer" in request.model_fields_set:
+            if request.chat_scorer is not None:
+                get_chat_scoring_service().resolve(request.chat_scorer)
+            update_fields["attack_metadata"] = {
+                **update_fields.get("attack_metadata", {}),
+                **AttackScoringInputs(scorer=request.chat_scorer, revision=str(uuid.uuid4())).to_metadata(),
+            }
+        if "attack_metadata" in update_fields:
+            expected_fields["attack_metadata"] = results[0].metadata
+        if request.objective is None and "chat_scorer" not in request.model_fields_set:
             await self._memory.update_attack_result_by_id_async(
                 attack_result_id=attack_result_id,
                 update_fields=update_fields,
@@ -603,7 +709,7 @@ class AttackService:
         try:
             await self._memory.update_attack_result_conditionally_async(
                 attack_result_id=attack_result_id,
-                expected_fields={"objective": results[0].objective},
+                expected_fields=expected_fields,
                 update_fields=update_fields,
             )
         except AttackStateConflictError as exc:
@@ -613,7 +719,19 @@ class AttackService:
 
     async def save_conversation_async(self, *, request: SaveConversationRequest) -> AddMessageResponse:
         """
-        Save a complete draft without changing source pieces or invoking a target.
+        Save a complete draft without invoking a target or replacing sent evidence.
+
+        Returns:
+            The stored attack and conversation.
+        """
+        if not request.reuse_unsent_conversation:
+            return await self._save_conversation_async(request=request)
+        with self._message_send_service.reserve_conversation(str(request.source_conversation_id)):
+            return await self._save_conversation_async(request=request)
+
+    async def _save_conversation_async(self, *, request: SaveConversationRequest) -> AddMessageResponse:
+        """
+        Prepare and persist a conversation while the caller holds any required source reservation.
 
         Returns:
             The stored attack and conversation.
@@ -629,7 +747,12 @@ class AttackService:
                     "operation": request.operation if request.operation_id is None else None,
                 }
             )
-        fingerprint = to_sha256(json.dumps(request.model_dump(mode="json"), sort_keys=True))
+        fingerprint_values = request.model_dump(mode="json", exclude={"default_chat_scorer"})
+        if request.default_chat_scorer is not None:
+            fingerprint_values["default_chat_scorer"] = request.default_chat_scorer.model_dump(mode="json")
+        if "chat_scorer" in request.model_fields_set and request.chat_scorer is None:
+            fingerprint_values["chat_scorer_explicitly_off"] = True
+        fingerprint = to_sha256(json.dumps(fingerprint_values, sort_keys=True))
         conversation_id = str(request.save_id)
         attack_result_id = (
             str(request.attack_result_id)
@@ -637,30 +760,69 @@ class AttackService:
             else str(uuid.uuid5(request.save_id, "attack"))
         )
         existing = await self._memory.get_attack_results_async(attack_result_ids=[attack_result_id])
-        if existing and existing[0].metadata.get(f"conversation_save:{conversation_id}") == fingerprint:
+        if existing and (
+            existing[0].metadata.get(f"conversation_save:{conversation_id}") == fingerprint
+            or existing[0].metadata.get(f"conversation_save:{conversation_id}:{fingerprint}")
+        ):
             return await self._saved_conversation_response_async(
                 attack_result_id=attack_result_id,
                 conversation_id=conversation_id,
             )
+        if (
+            request.reuse_unsent_conversation
+            and existing
+            and (
+                existing[0].metadata.get(f"conversation_save:{request.source_conversation_id}") == fingerprint
+                or existing[0].metadata.get(f"conversation_save:{request.source_conversation_id}:{fingerprint}")
+            )
+        ):
+            return await self._saved_conversation_response_async(
+                attack_result_id=attack_result_id,
+                conversation_id=str(request.source_conversation_id),
+            )
         source_pieces = await self._get_save_source_async(request=request)
+        replacements: dict[str, Sequence[MessagePiece]] | None = None
+        if request.reuse_unsent_conversation:
+            if set(source_pieces) != set(request.expected_source_piece_ids or []):
+                raise AttackStateConflictError("The conversation changed. Reload before leaving edit mode.")
+            if not any(
+                piece.role in ("assistant", "tool")
+                or piece.prompt_metadata.get(RequestTraceContext.REQUEST_METADATA_KEY)
+                or piece.prompt_metadata.get(RequestTraceContext.METADATA_KEY)
+                for piece in source_pieces.values()
+            ):
+                conversation_id = str(request.source_conversation_id)
+                replacements = {conversation_id: list(source_pieces.values())}
         same_attack = request.destination == "same_attack"
+        replay_registry_name = request.target_registry_name
         new_attack: AttackResult | None = None
         expected_fields: dict[str, Any] = {}
         update_fields: dict[str, Any] = {}
+        binding = request.target_binding
         if same_attack:
             attack_result_id = str(request.attack_result_id)
             results = await self._memory.get_attack_results_async(attack_result_ids=[attack_result_id])
             if not results:
                 raise ValueError("The destination attack does not exist")
             attack = results[0]
+            get_chat_scoring_service().require_manual(attack)
             if request.operation_id is not None and request.operation_id != attack.operation_id:
                 raise ValueError("Operation attribution is immutable on continuation")
+            original_registry_name = attack.metadata.get("target_registry_name")
+            if isinstance(original_registry_name, str):
+                replay_registry_name = original_registry_name
             if attack.operator and attack.operator != request.operator:
                 raise PermissionError("Cannot save to an attack owned by another operator")
             identifier = attack.get_attack_strategy_identifier()
             target_identifier = identifier.get_child("objective_target") if identifier else None
+            saved_binding = TargetBinding.from_metadata(attack.metadata)
+            if request.target_binding is not None and request.target_binding != saved_binding:
+                raise ValueError("Same attack must keep its temperature. Choose New attack to change it.")
+            binding = saved_binding
             if request.target_registry_name:
-                selected_target = await self._get_save_target_async(request.target_registry_name)
+                selected_target = await self._get_save_target_async(
+                    registry_name=request.target_registry_name, binding=binding
+                )
                 if (
                     target_identifier is None
                     or selected_target is None
@@ -674,22 +836,46 @@ class AttackService:
                 expected_fields["objective"] = (
                     request.expected_objective if request.expected_objective is not None else attack.objective
                 )
-                update_fields = self._objective_update_fields(old=attack.objective, new=request.objective)
+                update_fields = self._objective_update_fields(
+                    attack=attack, new=request.objective, default_scorer=request.default_chat_scorer
+                )
+                expected_fields["attack_metadata"] = attack.metadata
         else:
             attack_result_id = str(uuid.uuid5(request.save_id, "attack"))
-            target_identifier = await self._get_save_target_async(request.target_registry_name)
+            target_identifier = await self._get_save_target_async(
+                registry_name=request.target_registry_name, binding=request.target_binding
+            )
             new_attack = self._new_manual_attack(
                 request=request,
                 attack_result_id=attack_result_id,
                 conversation=Conversation(conversation_id=conversation_id, target_identifier=target_identifier),
                 objective=request.objective or "",
             )
+            if request.source_attack_result_id is not None:
+                [source] = await self._memory.get_attack_results_async(
+                    attack_result_ids=[str(request.source_attack_result_id)]
+                )
+                retained_ids = {
+                    piece.source_piece_id
+                    for message in request.messages
+                    for piece in message.pieces
+                    if piece.source_piece_id is not None
+                }
+                get_chat_scoring_service().continue_manually(
+                    source=source,
+                    destination=new_attack,
+                    source_conversation_id=str(request.source_conversation_id),
+                    retained_pieces=[piece for piece in source_pieces.values() if piece.id in retained_ids],
+                    explicit_selection="chat_scorer" in request.model_fields_set,
+                )
         target = await self._validate_editor_target_async(
             target_identifier=target_identifier,
-            registry_name=request.target_registry_name,
+            registry_name=replay_registry_name,
+            binding=binding,
         )
         persisted_paths: list[str] = []
         inserted = False
+        save_failed = False
         try:
             pieces = await self._prepare_message_pieces_async(
                 messages=request.messages,
@@ -713,7 +899,9 @@ class AttackService:
                     if same_attack
                     and request.source_conversation_id
                     and request.source_attack_result_id == request.attack_result_id
+                    and replacements is None
                     else None,
+                    replace_conversation_pieces=replacements,
                 )
             )
             try:
@@ -721,9 +909,30 @@ class AttackService:
             except asyncio.CancelledError:
                 inserted = await save_task
                 raise
+        except BaseException:
+            save_failed = True
+            raise
         finally:
-            if not inserted:
-                await self._cleanup_saved_media_async(persisted_paths)
+            target_cleanup_failed = False
+            try:
+                if binding and target:
+                    try:
+                        await release_component_async(target)
+                    except Exception:
+                        target_cleanup_failed = True
+                        if not save_failed:
+                            raise
+                        logger.exception("Failed to close temporary target after a conversation save failure")
+            finally:
+                if not inserted:
+                    try:
+                        await self._cleanup_saved_media_async(persisted_paths)
+                    except Exception:
+                        if not save_failed and not target_cleanup_failed:
+                            raise
+                        logger.exception(
+                            "Failed to roll back media after a conversation save or target cleanup failure"
+                        )
         return await self._saved_conversation_response_async(
             attack_result_id=attack_result_id,
             conversation_id=conversation_id,
@@ -780,13 +989,21 @@ class AttackService:
         )
         return {piece.id: piece for piece in pieces}
 
-    async def _get_save_target_async(self, registry_name: str | None) -> TargetIdentifier | None:
+    async def _get_save_target_async(
+        self, *, registry_name: str | None, binding: TargetBinding | None = None
+    ) -> TargetIdentifier | None:
         """
         Resolve an optional target without calling it.
 
         Returns:
             The target identity, or None for an unbound draft.
         """
+        if binding is not None:
+            target = await get_target_service().resolve_binding_async(binding)
+            try:
+                return TargetIdentifier.from_component_identifier(target.get_identifier())
+            finally:
+                await release_component_async(target)
         if registry_name is None:
             return None
         service = get_target_service()
@@ -859,7 +1076,7 @@ class AttackService:
                 prepared_pieces.append((saved, request_piece))
             prepared_messages.append(Message(message_pieces=prepared))
         if target:
-            target.validate_history(prepared_messages)
+            validate_history_replay(target=target, messages=prepared_messages)
         elif source_pieces is not None:
             validate_tool_conversation(prepared_messages)
         for saved, request_piece in prepared_pieces:
@@ -875,19 +1092,26 @@ class AttackService:
         *,
         target_identifier: ComponentIdentifier | None,
         registry_name: str | None,
+        binding: TargetBinding | None = None,
     ) -> PromptTarget | None:
         """
-        Resolve a registered target that supports editable, multi-turn history.
+        Resolve a registered target; check replay capabilities against the actual history separately.
 
         Returns:
             The resolved target for provider preflight, or None for an unbound draft.
 
         Raises:
-            ValueError: If a bound target is unavailable or cannot replay the draft.
+            ValueError: If a bound target is unavailable or its identity no longer matches.
         """
         if target_identifier is None:
             return None
         service = get_target_service()
+        if binding is not None:
+            target_object = await service.resolve_binding_async(binding)
+            if target_object.get_identifier().hash != target_identifier.hash:
+                await release_component_async(target_object)
+                raise ValueError("The saved target does not support this conversation")
+            return target_object
         target = await service.get_target_async(target_registry_name=registry_name) if registry_name else None
         if not registry_name:
             cursor = None
@@ -899,9 +1123,6 @@ class AttackService:
                     break
         if target is None or target.identifier.hash != target_identifier.hash:
             raise ValueError("The attack target is not registered. Choose New attack without a target.")
-        capabilities = target.capabilities
-        if not capabilities.supports_editable_history or not capabilities.supports_multi_turn:
-            raise ValueError("The selected target does not support editable history. Select a different target.")
         target_object = service.get_target_object(target_registry_name=target.target_registry_name)
         if target_object is None:
             raise ValueError("The selected target is no longer registered")
@@ -910,15 +1131,18 @@ class AttackService:
         return target_object
 
     @staticmethod
-    def _objective_update_fields(*, old: str, new: str) -> dict[str, Any]:
+    def _objective_update_fields(
+        *, attack: AttackResult, new: str, default_scorer: RegisteredComponentReference | None = None
+    ) -> dict[str, Any]:
         """
         Prepare objective changes without deleting historical scores.
 
         Returns:
             Fields to update, or an empty mapping when the objective is unchanged.
         """
-        if old == new:
+        if attack.objective == new:
             return {}
+        settings = get_chat_scoring_service().objective_settings(attack=attack, objective=new, scorer=default_scorer)
         return {
             "objective": new,
             "objective_sha256": to_sha256(new),
@@ -926,6 +1150,7 @@ class AttackService:
             "outcome_reason": None,
             "automated_score_id": None,
             "human_score_id": None,
+            "attack_metadata": {AttackResult.SCORING_ERRORS_KEY: {}, **(settings or {})},
         }
 
     async def remove_human_score_async(self, *, attack_result_id: str) -> AttackSummary | None:
@@ -938,43 +1163,54 @@ class AttackService:
         Returns:
             Updated AttackSummary if found, None otherwise.
         """
-        results = await self._memory.get_attack_results_async(attack_result_ids=[attack_result_id])
-        if not results:
-            return None
+        for _ in range(5):
+            results = await self._memory.get_attack_results_async(attack_result_ids=[attack_result_id])
+            if not results:
+                return None
+            attack = results[0]
+            automated_score = attack.automated_score
+            outcome = (
+                AttackOutcome.UNDETERMINED if automated_score is None else attack_outcome_from_score(automated_score)
+            )
+            try:
+                await self._memory.update_attack_result_conditionally_async(
+                    attack_result_id=attack_result_id,
+                    expected_fields={
+                        "automated_score_id": automated_score.id if automated_score else None,
+                        "human_score_id": attack.human_score.id if attack.human_score else None,
+                    },
+                    update_fields={
+                        "human_score_id": None,
+                        "outcome": outcome.value,
+                        "outcome_reason": automated_score.score_rationale
+                        if automated_score and outcome is not AttackOutcome.UNDETERMINED
+                        else None,
+                        "timestamp": datetime.now(UTC),
+                    },
+                )
+            except AttackStateConflictError:
+                continue
+            return await self.get_attack_async(attack_result_id=attack_result_id)
+        raise AttackObjectiveConflictError("Scores kept changing. Refresh before removing the human override.")
 
-        automated_score = results[0].automated_score
-        # Follow the attack-side contract of attack_outcome_from_score (#3181): read the
-        # typed score value instead of comparing the raw string, and treat an undetermined
-        # score as neither achievement nor refutation.
-        outcome = AttackOutcome.UNDETERMINED if automated_score is None else attack_outcome_from_score(automated_score)
-        if outcome is AttackOutcome.UNDETERMINED or automated_score is None:
-            outcome_reason = None
-        else:
-            outcome_reason = automated_score.score_rationale
-
-        await self._memory.update_attack_result_by_id_async(
-            attack_result_id=attack_result_id,
-            update_fields={
-                "human_score_id": None,
-                "outcome": outcome.value,
-                "outcome_reason": outcome_reason,
-                "timestamp": datetime.now(UTC),
-            },
-        )
-
-        return await self.get_attack_async(attack_result_id=attack_result_id)
-
-    async def get_conversations_async(self, *, attack_result_id: str) -> AttackConversationsResponse | None:
+    async def get_conversations_async(
+        self, *, attack_result_id: str, limit: int | None = None, cursor: str | None = None
+    ) -> AttackConversationsResponse | None:
         """
-        Get all conversations belonging to an attack.
+        Get main and pruned conversations belonging to an attack.
 
-        Includes the main conversation and all related conversations from the
-        AttackResult. Each entry is enriched with message count, a preview,
+        Each entry is enriched with message count, a preview,
         and the earliest message timestamp using a single batched query.
 
         Returns:
             AttackConversationsResponse if attack found, None otherwise.
         """
+        if limit is not None:
+            return await self._saved_conversation_reader.list_conversations_async(
+                attack_result_id=attack_result_id, limit=limit, cursor=cursor
+            )
+        if cursor is not None:
+            raise ValueError("A conversation-page cursor requires a limit.")
         results = await self._memory.get_attack_results_async(attack_result_ids=[attack_result_id])
         if not results:
             return None
@@ -1038,6 +1274,7 @@ class AttackService:
 
         ar = results[0]
         now = datetime.now(UTC)
+        get_chat_scoring_service().require_manual(ar)
 
         # Validate that both or neither branching fields are provided
         if (request.source_conversation_id is None) != (request.cutoff_index is None):
@@ -1074,6 +1311,23 @@ class AttackService:
                 target_identifier=objective_target,
             )
 
+        if all_pieces and conversation.target_identifier is not None:
+            binding = TargetBinding.from_metadata(ar.metadata)
+            target = await self._validate_editor_target_async(
+                target_identifier=conversation.target_identifier,
+                registry_name=ar.metadata.get("target_registry_name")
+                if isinstance(ar.metadata.get("target_registry_name"), str)
+                else None,
+                binding=binding,
+            )
+            try:
+                if target:
+                    validate_history_replay(
+                        target=target, messages=group_conversation_message_pieces_by_sequence(all_pieces)
+                    )
+            finally:
+                if binding and target:
+                    await release_component_async(target)
         stored = await self._memory.add_conversation_branches_to_attack_async(
             attack_result_id=attack_result_id,
             conversations=[conversation],
@@ -1105,6 +1359,7 @@ class AttackService:
 
         ar = results[0]
         target_conv_id = request.conversation_id
+        get_chat_scoring_service().require_manual(ar)
 
         # Only user-visible conversations can become the main conversation.
         if target_conv_id not in ar.get_active_conversation_ids():
@@ -1167,18 +1422,23 @@ class AttackService:
         if results and results[0].metadata.get("target_unbound") is True:
             if request.target_conversation_id not in results[0].get_active_conversation_ids():
                 raise ValueError(f"Conversation '{request.target_conversation_id}' is not part of this attack")
-            await self._bind_manual_target_async(attack=results[0], registry_name=request.target_registry_name)
+            await self._bind_manual_target_async(
+                attack=results[0], registry_name=request.target_registry_name, binding=request.target_binding
+            )
 
-    async def _bind_manual_target_async(self, *, attack: AttackResult, registry_name: str | None) -> AttackResult:
+    async def _bind_manual_target_async(
+        self, *, attack: AttackResult, registry_name: str | None, binding: TargetBinding | None = None
+    ) -> AttackResult:
         """
         Bind an explicitly unbound manual attack before its first send.
 
         Returns:
             The reloaded, target-bound attack.
         """
+        get_chat_scoring_service().require_manual(attack)
         if not registry_name:
             raise ValueError("Select a target before sending")
-        target = await self._get_save_target_async(registry_name)
+        target = await self._get_save_target_async(registry_name=registry_name, binding=binding)
         conversations = {
             conversation_id: await self._memory.get_conversation_messages_async(conversation_id=conversation_id)
             for conversation_id in attack.get_active_conversation_ids()
@@ -1186,10 +1446,15 @@ class AttackService:
         target_object = await self._validate_editor_target_async(
             target_identifier=target,
             registry_name=registry_name,
+            binding=binding,
         )
-        if target_object:
-            for conversation in conversations.values():
-                target_object.validate_history(conversation)
+        try:
+            if target_object:
+                for conversation in conversations.values():
+                    validate_history_replay(target=target_object, messages=conversation)
+        finally:
+            if binding and target_object:
+                await release_component_async(target_object)
         atomic = AtomicAttackIdentifier.build(
             attack_identifier=AttackIdentifier(
                 class_name="ManualAttack",
@@ -1197,7 +1462,11 @@ class AttackService:
                 objective_target=target,
             )
         )
-        metadata = {"target_unbound": False, "target_registry_name": registry_name}
+        metadata = {
+            "target_unbound": False,
+            "target_registry_name": registry_name,
+            **(binding.to_metadata() if binding else {}),
+        }
         await self._memory.update_attack_result_conditionally_async(
             attack_result_id=attack.attack_result_id,
             expected_fields={

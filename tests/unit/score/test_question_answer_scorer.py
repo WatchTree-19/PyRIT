@@ -315,7 +315,7 @@ async def test_legacy_hooks_reject_their_own_typed_criteria_async(
     with (
         patch.object(scorer_type, "CONDITION_TYPE", AnswerMatches),
         patch.object(scorer, "_score_piece_async", new_callable=AsyncMock) as leaf,
-        pytest.raises(RuntimeError, match="matched typed conditions"),
+        pytest.raises(LegacyScorerHookError, match="matched typed conditions"),
     ):
         await scorer.score_async(scorable=ContentScorable(value="Paris"), expectation=expectation)
     leaf.assert_not_awaited()

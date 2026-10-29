@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
-import type { DragEvent, KeyboardEvent, ReactNode } from 'react'
+import type { DragEvent, ReactNode } from 'react'
 
 import {
   Button,
@@ -14,15 +14,18 @@ import {
   DismissRegular,
   OpenRegular,
   PlayRegular,
-  ReOrderDotsVerticalRegular,
 } from '@fluentui/react-icons'
 
 import CreateConverterDialog from '@/components/Registry/CreateConverterDialog'
+import SelectConverterInput from '@/components/Converters/SelectConverterInput'
+import ConverterCard from '@/components/Converters/ConverterCard'
 import { useRuntime } from '@/hooks/useRuntime'
 import { convertersApi } from '@/services/api'
 import { toApiError } from '@/services/errors'
+import { groupConverters } from '@/utils/groupConverters'
 import type {
   ChatConverterController, ConverterInputPiece, ConverterInstance, ConverterPipelineStage, ConverterStageResult,
+  SourceInstanceSpec, ConverterIdentifier, PieceConversionUpdates,
 } from '@/types'
 
 import {
@@ -34,7 +37,6 @@ import {
 } from '../converterTypes'
 import { useConverterPanelStyles } from './ConverterPanel.styles'
 import ConversionTextEditor from './ConversionTextEditor'
-import SelectConverterInput from './SelectConverterInput'
 
 const PIECE_TYPE_LABELS: Record<string, string> = {
   text: 'Text',
@@ -44,11 +46,9 @@ const PIECE_TYPE_LABELS: Record<string, string> = {
   file: 'File',
 }
 
-const OUTPUT_TYPE_ORDER = ['text', 'image_path', 'audio_path', 'video_path', 'binary_path']
-
 const MIN_PANEL_WIDTH = 480
 const MAX_PANEL_WIDTH = 1200
-const DEFAULT_PANEL_WIDTH = 800
+const DEFAULT_PANEL_WIDTH = 560
 
 interface ValuePreviewProps {
   dataType: string
@@ -67,7 +67,7 @@ interface ConverterPanelProps {
   onClose: () => void
   controller: ChatConverterController
   selectedMessageCount?: number
-  onApply?: () => void
+  onApply?: (updates: PieceConversionUpdates) => void
 }
 
 interface SelectedConverter extends ConverterInstance {
@@ -175,9 +175,30 @@ export default function ConverterPanel({
   const [isLoading, setIsLoading] = useState(true)
   const [error, setError] = useState<string | null>(null)
   const [createDialogOpen, setCreateDialogOpen] = useState(false)
+  const [settings, setSettings] = useState<{
+    stageId: string
+    pieceType: string
+    editing: { converter: ConverterInstance; spec?: SourceInstanceSpec }
+  } | null>(null)
+  const [settingsGeneration, setSettingsGeneration] = useState(generation)
+  if (settingsGeneration !== generation) {
+    setSettingsGeneration(generation)
+    setSettings(null)
+  }
+  const discardTemporarySettings = controller.discardTemporarySettings
+  useEffect(() => () => discardTemporarySettings?.(), [discardTemporarySettings])
   const [panelWidth, setPanelWidth] = useState(DEFAULT_PANEL_WIDTH)
   const isResizing = useRef(false)
   const draggedConverterIndex = useRef<number | null>(null)
+  const applyResult = (applied: PieceConversionUpdates | void): void => {
+    if (applied) onApply?.(applied)
+  }
+  const convert = async (pieceType: string): Promise<void> => {
+    applyResult(await controller.convert(pieceType))
+  }
+  const convertRemaining = async (pieceId: string, stageId: string): Promise<void> => {
+    applyResult(await controller.convertRemaining(pieceId, stageId))
+  }
 
   const tabs = useMemo(() => {
     const seen = new Set(['text'])
@@ -252,7 +273,7 @@ export default function ConverterPanel({
   const selectedConverters = useMemo(
     () => selectedStages.flatMap((stage: ConverterPipelineStage): SelectedConverter[] => {
       const converter = converters.find((candidate: ConverterInstance) => candidate.converter_id === stage.converterId)
-      return converter ? [{ ...converter, stageId: stage.id }] : []
+      return converter ? [{ ...converter, identifier: stage.identifier ?? converter.identifier, stageId: stage.id }] : []
     }),
     [converters, selectedStages],
   )
@@ -267,18 +288,7 @@ export default function ConverterPanel({
     return supported.length === 0 || supported.includes(nextInputType)
   })
 
-  const groups: Record<string, ConverterInstance[]> = {}
-  for (const converter of filteredConverters) {
-    const outputType = converter.identifier.supported_output_types?.[0] ?? 'text'
-    if (!groups[outputType]) groups[outputType] = []
-    groups[outputType].push(converter)
-  }
-  const unknownTypes = Object.keys(groups).filter(
-    (type: string) => !OUTPUT_TYPE_ORDER.includes(type),
-  )
-  const groupedConverters = [...OUTPUT_TYPE_ORDER, ...unknownTypes]
-    .filter((type: string) => groups[type]?.length)
-    .map((type: string) => ({ type, converters: groups[type] }))
+  const groupedConverters = groupConverters(filteredConverters)
 
   const activePipelineConfigured = selectedStages.length > 0
   const convertibleInputs = activeInputs.filter(
@@ -331,19 +341,6 @@ export default function ConverterPanel({
     if (sourceIndex === null) return
     event.preventDefault()
     moveConverter(sourceIndex, targetIndex)
-  }, [moveConverter])
-
-  const handleReorderKeyDown = useCallback((
-    event: KeyboardEvent<HTMLButtonElement>,
-    index: number,
-  ): void => {
-    if (event.key === 'ArrowUp') {
-      event.preventDefault()
-      moveConverter(index, index - 1)
-    } else if (event.key === 'ArrowDown') {
-      event.preventDefault()
-      moveConverter(index, index + 1)
-    }
   }, [moveConverter])
 
   const handleMouseDown = useCallback((): void => {
@@ -433,7 +430,7 @@ export default function ConverterPanel({
             allowSelection={selectedConverters.length > 0}
             edited={workingInputs[input.id] !== undefined && workingInputs[input.id] !== input.value}
             onChange={input.dataType === 'text'
-              ? (value: string) => controller.editInput(input.id, value)
+              ? (value: string) => applyResult(controller.editInput(input.id, value))
               : undefined}
             testId="converter-input-value"
             value={workingInputs[input.id] ?? input.value}
@@ -455,7 +452,7 @@ export default function ConverterPanel({
                   appearance="primary"
                   size="small"
                   icon={isConverting ? <Spinner size="tiny" /> : <PlayRegular />}
-                  onClick={() => void controller.convert(effectiveActiveTab)}
+                  onClick={() => void convert(effectiveActiveTab)}
                   disabled={!ready || isConverting || convertibleInputs.length === 0}
                   className={styles.previewButton}
                   title={`Convert the configured ${
@@ -487,59 +484,31 @@ export default function ConverterPanel({
                   : ''
                 const cardTestIdSuffix = occurrenceNumber > 1 ? `-${occurrenceNumber}` : ''
                 return (
-                  <div
+                  <ConverterCard
                     key={converter.stageId}
-                    className={styles.converterCard}
-                    data-testid={`converter-item-${converter.converter_id}${cardTestIdSuffix}`}
+                    name={converter.converter_id}
+                    converter={converter}
+                    context={duplicateStageContext}
+                    temporary={Boolean(selectedStages[index]?.temporary)}
+                    disabled={isConverting}
+                    testId={`converter-item-${converter.converter_id}${cardTestIdSuffix}`}
+                    dragTestId={`converter-drag-area-${index}`}
                     onDragOver={(event: DragEvent<HTMLDivElement>) => {
                       if (draggedConverterIndex.current !== null) event.preventDefault()
                     }}
                     onDrop={(event: DragEvent<HTMLDivElement>) => handleDrop(event, index)}
+                    onDragStart={(event) => handleDragStart(event, index)}
+                    onDragEnd={() => { draggedConverterIndex.current = null }}
+                    onMove={(delta) => moveConverter(index, index + delta)}
+                    onRemove={() => removeConverter(index)}
+                    onSettings={() => setSettings({
+                      stageId: converter.stageId, pieceType: effectiveActiveTab,
+                      editing: { converter, spec: selectedStages[index]?.temporary },
+                    })}
+                    onReset={() => setPipeline(effectiveActiveTab, (stages) => stages.map((stage) =>
+                      stage.id === converter.stageId ? { id: stage.id, converterId: stage.converterId } : stage,
+                    ))}
                   >
-                    <div
-                      className={styles.converterCardHeader}
-                      draggable
-                      data-testid={`converter-drag-area-${index}`}
-                      onDragStart={(event: DragEvent<HTMLDivElement>) => {
-                        if ((event.target as HTMLElement).closest('[data-no-drag]')) {
-                          event.preventDefault()
-                          return
-                        }
-                        handleDragStart(event, index)
-                      }}
-                      onDragEnd={() => { draggedConverterIndex.current = null }}
-                    >
-                      <Button
-                        appearance="subtle"
-                        size="small"
-                        icon={<ReOrderDotsVerticalRegular />}
-                        className={styles.dragHandle}
-                        aria-label={`Reorder converter ${converter.converter_id}${duplicateStageContext}`}
-                        title="Drag this header to reorder. Use the arrow keys for keyboard reordering."
-                        onKeyDown={(event: KeyboardEvent<HTMLButtonElement>) => handleReorderKeyDown(event, index)}
-                      />
-                      <Text weight="semibold" size={300} className={styles.converterName}>
-                        {converter.converter_id}
-                      </Text>
-                      {converter.is_llm_based && <span className={styles.llmBadge}>LLM</span>}
-                      <Button
-                        appearance="subtle"
-                        size="small"
-                        icon={<DismissRegular />}
-                        data-no-drag
-                        aria-label={`Remove converter ${converter.converter_id}${duplicateStageContext}`}
-                        onClick={() => removeConverter(index)}
-                        className={styles.touchTarget}
-                      />
-                    </div>
-                    {converter.identifier.class_name !== converter.converter_id && (
-                      <Text size={200} className={styles.hintText}>
-                        {converter.identifier.class_name}
-                      </Text>
-                    )}
-                    <Text size={200} className={styles.hintText}>
-                      {converter.description || 'No description is available.'}
-                    </Text>
                     {!isBatch && activeInputs.map((input: ConverterInputPiece) => {
                       const stage = stageResults[input.id]?.find(
                         (result: ConverterStageResult) => result.stageId === converter.stageId,
@@ -562,7 +531,7 @@ export default function ConverterPanel({
                             edited={stage !== undefined && stage.value !== stage.generated.output_value}
                             allowSelection={hasRemaining}
                             onChange={stage && outputType === 'text'
-                              ? (value: string) => controller.editStageOutput(input.id, converter.stageId, value)
+                              ? (value: string) => applyResult(controller.editStageOutput(input.id, converter.stageId, value))
                               : undefined}
                           />
                           {hasRemaining && (
@@ -573,7 +542,7 @@ export default function ConverterPanel({
                               disabled={isConverting || stage === undefined}
                               aria-label={`Convert ${input.name} from stage ${index + 2} to end`}
                               title="Convert all remaining stages from this value."
-                              onClick={() => void controller.convertRemaining(input.id, converter.stageId)}
+                              onClick={() => void convertRemaining(input.id, converter.stageId)}
                             >
                               Convert
                             </Button>
@@ -581,7 +550,7 @@ export default function ConverterPanel({
                         </div>
                       )
                     })}
-                  </div>
+                  </ConverterCard>
                 )
               })}
               {isBatch && Object.keys(results).length > 0 && (
@@ -608,16 +577,6 @@ export default function ConverterPanel({
                   ))}
                 </section>
               )}
-              <Button
-                appearance="primary"
-                onClick={onApply ?? controller.apply}
-                disabled={!ready || isConverting || Object.keys(results).length === 0}
-                className={styles.addConvertedButton}
-                data-testid="use-converted-btn"
-              >
-                {onApply && Object.keys(errors).length > 0
-                  ? 'Apply successful results' : isBatch ? 'Add converted values' : 'Add converted value'}
-              </Button>
             </div>
           )}
         </div>
@@ -630,11 +589,23 @@ export default function ConverterPanel({
       <CreateConverterDialog
         open={createDialogOpen}
         onClose={() => setCreateDialogOpen(false)}
-        onCreated={(converterId: string) => {
-          setCreateDialogOpen(false)
+        onCreated={(converterId: string, isCurrentOpening: boolean) => {
+          if (isCurrentOpening) setCreateDialogOpen(false)
           void loadConverters(converterId, effectiveActiveTab)
         }}
       />
+      {settings && <CreateConverterDialog
+        open
+        editing={settings.editing}
+        onClose={() => setSettings(null)}
+        onCreated={() => { throw new Error('Settings must not register a converter.') }}
+        onTemporary={(spec: SourceInstanceSpec, identifier: ConverterIdentifier) => {
+          setPipeline(settings.pieceType, (stages: ConverterPipelineStage[]) => stages.map((stage) =>
+            stage.id === settings.stageId ? { ...stage, temporary: spec, identifier } : stage,
+          ))
+          setSettings(null)
+        }}
+      />}
     </div>
   )
 }

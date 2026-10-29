@@ -54,9 +54,9 @@ class ScorerPromptValidator:
             raise_on_no_valid_pieces (bool | None): Whether to raise ValueError when no pieces are valid.
                 Defaults to False, allowing scorers to return ``[]`` for non-applicable evidence.
                 Set to True to raise an exception instead.
-            is_objective_required (bool): Whether an objective must be provided for scoring. Defaults to False.
+            is_objective_required (bool): Infer ``MatchesObjective`` on an undeclared message scorer.
+                The scorer validates that condition before acquiring evidence. Defaults to False.
         """
-        self._supported_data_types: Sequence[PromptDataType]
         if supported_data_types:
             self._supported_data_types = supported_data_types
         else:
@@ -67,7 +67,7 @@ class ScorerPromptValidator:
         else:
             self._supported_roles = DEFAULT_SUPPORTED_ROLES
 
-        self._required_metadata: Sequence[str] = required_metadata or []
+        self._required_metadata = required_metadata or []
 
         self._max_pieces_in_response = max_pieces_in_response
         self._max_text_length = max_text_length
@@ -86,31 +86,17 @@ class ScorerPromptValidator:
         """
         return self._is_objective_required
 
-    @property
-    def supported_data_types(self) -> tuple[PromptDataType, ...]:
-        """The message piece data types this validator accepts."""
-        return tuple(self._supported_data_types)
-
-    @property
-    def supported_roles(self) -> tuple[ChatMessageRole, ...]:
-        """The message roles this validator accepts."""
-        return tuple(self._supported_roles)
-
-    @property
-    def required_metadata(self) -> tuple[str, ...]:
-        """The metadata keys every accepted message piece must carry."""
-        return tuple(self._required_metadata)
-
     def validate(self, message: Message, objective: str | None) -> None:
         """
-        Validate a message and objective against configured requirements.
+        Validate message evidence against configured requirements.
 
         Args:
             message (Message): The message to validate.
-            objective (str | None): The objective string, if required.
+            objective (str | None): Compatibility parameter, retained for custom validator overrides.
+                Objective requirements are checked by the scorer, not by this validator.
 
         Raises:
-            ValueError: If validation fails due to unsupported pieces, exceeding max pieces, or missing objective.
+            ValueError: If validation fails due to unsupported pieces or exceeding max pieces.
         """
         valid_pieces_count = 0
         for piece in message.message_pieces:
@@ -139,9 +125,6 @@ class ScorerPromptValidator:
                 f"Message has {len(message.message_pieces)} pieces, "
                 f"exceeding the limit of {self._max_pieces_in_response}."
             )
-
-        if self._is_objective_required and not objective:
-            raise ValueError("Objective is required but not provided.")
 
     def is_role_supported(self, message_piece: MessagePiece) -> bool:
         """

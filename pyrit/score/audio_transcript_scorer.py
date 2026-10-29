@@ -133,12 +133,10 @@ class AudioTranscriptHelper:
         Raises:
             ValueError: If the scorer does not support text or requires stored conversation history.
         """
-        supported_data_types = scorer.capabilities.supported_data_types
-        if supported_data_types is None or "text" not in supported_data_types:
-            supported = sorted(supported_data_types) if supported_data_types is not None else "none reported"
+        if "text" not in scorer._validator._supported_data_types:
             raise ValueError(
-                "text_capable_scorer must be a message scorer that supports 'text' data type. "
-                f"Supported types: {supported}"
+                f"text_capable_scorer must support 'text' data type. "
+                f"Supported types: {scorer._validator._supported_data_types}"
             )
         pending: list[Scorer] = [scorer]
         while pending:
@@ -161,11 +159,13 @@ class AudioTranscriptHelper:
             expectation (ScoringExpectation | None): Criteria forwarded to the transcript scorer.
 
         Returns:
-            List of scores for the transcribed audio.
+            List of scores for the transcribed audio, or an empty list when the
+            transcript is empty (there is no text to score).
 
         Raises:
             FileNotFoundError: If the audio file does not exist.
-            ValueError: If transcription fails or returns empty text.
+            Exception: Whatever the transcription step raises when it fails; the
+                original exception is re-raised as-is (see ``_transcribe_audio_async``).
         """
         audio_path = message_piece.converted_value
 

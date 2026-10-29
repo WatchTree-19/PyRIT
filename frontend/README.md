@@ -29,10 +29,20 @@ conversations), open the
 conversation panel, and select the copy at its full
 `/attacks/{attack_id}/conversations/{conversation_id}` URL. Copying
 within a target-free attack keeps it target-free until you send a prompt.
+For single-turn targets or targets that cannot replay the first prompt as history,
+**Branch conversation** on that first user turn restores it to the prompt box
+without copying the response. After a successful single send, **Undo last send**
+also restores the prompt in a new conversation, if the target can replay the
+preceding history. Both actions restore the saved prompt and converter results
+for text, image, audio, video, and mixed responses. They do not overwrite new
+prompt edits or changed converter pipelines.
 When you save an edited conversation, its final user turn moves to the prompt
 box instead of saved history. Text and attachments retain their metadata,
 including text-only video remix IDs. You can enter and edit prompts without a target.
 Send stays disabled until you select a target; no target-warning box is shown.
+Hover over Send, or focus it with the keyboard, to see why sending is disabled.
+The warning button in the labels bar reports a placeholder operator and an
+unselected operation. Operation remains optional and does not block sending.
 
 **Use in scan** opens the configuration to apply a PyRIT attack technique after
 prepending history including the selected turn. It saves a target-free copy
@@ -50,6 +60,12 @@ request converters run on the stored history during the scan, without changing
 the source conversation. New outgoing turns are always converted.
 
 ## Dataset catalog
+
+Chat drafts stay in memory while you visit Datasets and return. Text, attachments,
+system prompts, the selected target, and converter setup/results return to their
+original attack and conversation. A loading, missing, or read-only destination
+does not consume the draft. Starting a new attack or leaving the Chat/Datasets
+journey discards the handoff; refreshing the browser does not retain it.
 
 The **Datasets** page shows summaries of datasets already loaded into the backend's
 memory. When memory is empty, **Learn how to load datasets into memory** opens the
@@ -76,8 +92,8 @@ Expanded details stack each label above its stored value.
 ## Resuming a scenario run
 
 Failed runs offer **Resume run** on the run page and **Resume** in Scanner History.
-See the [GUI guide](../doc/gui/0_gui.md#resuming-a-failed-scanner-run) for resume
-behavior and the saved launch configuration requirement.
+See the [GUI History guide](../doc/gui/0_gui.md#history) for a short overview
+of resume behavior.
 
 ## Default labels after runtime changes
 
@@ -96,8 +112,7 @@ and keep that attack's attribution.
 
 Open **Analytics** to filter saved results, compare SDK-computed outcome
 statistics, and drill into matching attacks. See the
-[analytics GUI guide](../doc/gui/0_gui.md#attack-results-analytics) for cohort
-semantics, denominators, time bounds, URL sharing, and refresh behavior.
+[analytics GUI guide](../doc/gui/0_gui.md#analytics) for a short overview.
 The implementation follows
 [part 5 of the analytics roadmap](https://gist.github.com/romanlutz/34230aba87f7fa07996772a4099e9a78).
 
@@ -249,6 +264,7 @@ npm run test:coverage # Run with coverage report (85%+ threshold)
 # End-to-End Tests (Playwright)
 npm run test:e2e          # Run headless (default local setup uses dev.py)
 npm run test:e2e:headed   # Run with visible browser windows (requires display)
+npm run test:e2e:paired-outcomes # Real SQLite/API paired-outcome acceptance tests
 npm run test:e2e:ui       # Interactive UI mode (requires display)
 ```
 
@@ -283,11 +299,24 @@ E2E_LIVE_MODE=true npx playwright test
 
 The mock and seeded projects run in the **GitHub Actions** pull-request workflow. The live project is intended for a protected pipeline with an Entra identity or API keys.
 
+For ordinary interactions with startup controls, call `waitForAppReady(page)`
+from `e2e/_runtime.ts` after navigation or reload. A visible control can still
+move as runtime readiness and configured defaults arrive. Tests that deliberately
+interact before startup finishes should control those responses instead.
+
+Before reloading to check a saved preference, poll its stored value rather than
+relying on the optimistic input value. After reload, wait for app readiness
+before asserting the restored value, especially when an empty input is expected:
+an empty Operation picker can mean its saved-ID lookup is still loading.
+The operation-picker suite keeps this persistence barrier local so its deliberate
+early-startup interactions remain unsynchronized.
+
 CI runs two isolated mock shards, one serial seeded job, and one isolated
 analytics job, with one worker per job. Mock and seeded jobs start their own
 Vite server and Python backend because mock specs still depend on backend auth
-bootstrap and some API calls. The analytics job serves its production build
-from the disposable SQLite fixture. Jobs never share backend state.
+bootstrap and some API calls. The seeded job serves a production build through
+`vite preview`, and the analytics job serves its production build from the
+disposable SQLite fixture. Jobs never share backend state.
 The required **Frontend E2E Tests** check merges their reports and fails
 if any shard fails, is cancelled, or is missing a report. Skipped and flaky tests
 also fail CI.
@@ -305,7 +334,12 @@ only a dedicated Vite server, expects the backend to already be running, and
 disables server reuse.
 
 In CI with `E2E_SEEDED_MODE=true`, Playwright starts its own backend and Vite
-servers with reuse disabled, even when `E2E_FRONTEND_PORT` is set.
+servers with reuse disabled, even when `E2E_FRONTEND_PORT` is set. Adding
+`E2E_PRODUCTION_FRONTEND=true` builds the frontend and serves it with
+`vite preview` instead of the dev server. CI sets it for the seeded job because
+those specs reload the app often, and each production-bundle load is much
+faster. Mock specs need the dev server because some import `/src` modules in
+the browser.
 
 > **Note**: `test:e2e:ui` and `test:e2e:headed` require a graphical display and won't work in headless environments like devcontainers. Use `npm run test:e2e` for CI/headless testing.
 

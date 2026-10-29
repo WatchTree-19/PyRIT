@@ -12,11 +12,14 @@ from pyrit.backend.models.operations import (
     FindingEvidenceAttachResponse,
     FindingEvidenceCreateRequest,
     FindingEvidenceListResponse,
+    FindingExportRequest,
     FindingListResponse,
     FindingOptionsResponse,
+    OperationDetail,
     OperationListResponse,
     OperationUpdateRequest,
 )
+from pyrit.backend.services.finding_export import export_findings_async
 from pyrit.backend.services.operation_service import (
     DuplicateOperationError,
     FindingConflictError,
@@ -25,6 +28,7 @@ from pyrit.backend.services.operation_service import (
     OperationNotFoundError,
     OperationService,
 )
+from pyrit.memory.memory_interface import OperationInUseError
 from pyrit.models import Finding, FindingCreate, Operation, OperationCreate
 from pyrit.models.harm_category import HarmCategory
 
@@ -47,10 +51,7 @@ async def create_operation_async(request: OperationCreate) -> Operation:
     try:
         return await OperationService().create_async(request)
     except DuplicateOperationError as exc:
-        raise HTTPException(
-            status_code=status.HTTP_409_CONFLICT,
-            detail={"message": str(exc), "operation": exc.existing.model_dump(mode="json")},
-        ) from exc
+        raise _name_conflict(exc) from exc
 
 
 @router.get("", response_model=OperationListResponse)
@@ -75,26 +76,54 @@ async def get_finding_options_async() -> FindingOptionsResponse:
     return FindingOptionsResponse(harm_types=list(HarmCategory))
 
 
-@router.get("/{operation_id}", response_model=Operation)
-async def get_operation_async(operation_id: UUID) -> Operation:
+@router.get("/{operation_id}", response_model=OperationDetail)
+async def get_operation_async(operation_id: UUID) -> OperationDetail:
     """
-    Read one operation.
+    Read one operation with the counts of findings, attacks, and scenario runs that refer to it by ID.
 
     Returns:
-        Operation: The requested operation.
+        OperationDetail: The requested operation and its usage.
     """
-    return await _require_operation_async(OperationService().get_async(operation_id))
+    return await _require_operation_async(OperationService().get_detail_async(operation_id))
 
 
 @router.patch("/{operation_id}", response_model=Operation)
 async def update_operation_async(*, operation_id: UUID, request: OperationUpdateRequest) -> Operation:
     """
-    Replace an operation's description. The last save wins.
+    Rename an operation or replace its description. Omitted fields are unchanged and the last save wins.
 
     Returns:
         Operation: The updated operation.
+
+    Raises:
+        HTTPException: 409 with the existing operation when another operation has the name.
     """
-    return await _require_operation_async(OperationService().update_async(operation_id=operation_id, request=request))
+    try:
+        return await _require_operation_async(
+            OperationService().update_async(operation_id=operation_id, request=request)
+        )
+    except DuplicateOperationError as exc:
+        raise _name_conflict(exc) from exc
+
+
+@router.delete("/{operation_id}", status_code=status.HTTP_204_NO_CONTENT)
+async def delete_operation_async(operation_id: UUID) -> Response:
+    """
+    Permanently remove an operation that no findings, attacks, or scenario runs refer to by ID.
+
+    Returns:
+        Response: An empty success response.
+
+    Raises:
+        HTTPException: 409 with the usage counts when the operation is in use.
+    """
+    try:
+        await _require_operation_async(OperationService().delete_async(operation_id))
+    except OperationInUseError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT, detail={"message": str(exc), "usage": exc.usage.model_dump()}
+        ) from exc
+    return Response(status_code=status.HTTP_204_NO_CONTENT)
 
 
 @router.post("/{operation_id}/findings", response_model=Finding, status_code=status.HTTP_201_CREATED)
@@ -134,6 +163,24 @@ async def list_operation_findings_async(
     """
     return await _require_operation_async(
         OperationService().list_findings_async(operation_id=operation_id, limit=limit, offset=offset, title_query=title)
+    )
+
+
+@router.post("/{operation_id}/findings/export", response_class=Response)
+async def export_operation_findings_async(*, operation_id: UUID, request: FindingExportRequest) -> Response:
+    """
+    Download selected findings of an operation as one Word or Markdown document, in the dashboard's order.
+
+    Evidence appears as saved metadata and dashboard links, without transcripts.
+
+    Returns:
+        Response: The complete document as an attachment.
+    """
+    exported = await _require_operation_async(export_findings_async(operation_id=operation_id, request=request))
+    return Response(
+        content=exported.content,
+        media_type=exported.media_type,
+        headers={"Content-Disposition": f'attachment; filename="{exported.filename}"'},
     )
 
 
@@ -225,3 +272,10 @@ async def _require_operation_async(pending: Awaitable[T]) -> T:
         return await pending
     except (OperationNotFoundError, FindingNotFoundError, FindingEvidenceNotFoundError) as exc:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc)) from exc
+
+
+def _name_conflict(exc: DuplicateOperationError) -> HTTPException:
+    return HTTPException(
+        status_code=status.HTTP_409_CONFLICT,
+        detail={"message": str(exc), "operation": exc.existing.model_dump(mode="json")},
+    )

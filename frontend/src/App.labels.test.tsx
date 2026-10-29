@@ -3,7 +3,17 @@ import userEvent from '@testing-library/user-event'
 import { MemoryRouter } from 'react-router'
 
 import { useScenarioRunProgress } from '@/hooks/useScenarioRunProgress'
-import { attacksApi, labelsApi, operationsApi, runtimeApi, scenariosApi, targetsApi, versionApi } from '@/services/api'
+import {
+  attacksApi,
+  labelsApi,
+  operationsApi,
+  runtimeApi,
+  scenarioPresetsApi,
+  scenariosApi,
+  scenarioSuitesApi,
+  targetsApi,
+  versionApi,
+} from '@/services/api'
 import { makeTarget } from '@/test-utils/targetFixtures'
 import type { RegisteredScenario } from '@/types'
 import { exportConversation } from '@/utils/conversationExport'
@@ -60,6 +70,8 @@ jest.mock('@/services/api', () => ({
     startRun: jest.fn(),
     cancelRun: jest.fn(),
   },
+  scenarioPresetsApi: { list: jest.fn() },
+  scenarioSuitesApi: { list: jest.fn() },
 }))
 
 const SCENARIO: RegisteredScenario = {
@@ -175,6 +187,8 @@ describe('Shared new run labels', () => {
       items: [SCENARIO], pagination: { limit: 200, has_more: false },
     })
     jest.mocked(scenariosApi.estimateRun).mockResolvedValue(SCENARIO.default_run_size)
+    jest.mocked(scenarioPresetsApi.list).mockResolvedValue({ source: '', items: [] })
+    jest.mocked(scenarioSuitesApi.list).mockResolvedValue({ source: '', items: [] })
     jest.mocked(scenariosApi.startRun).mockResolvedValue({
       scenario_result_id: 'saved_run', scenario_name: SCENARIO.scenario_name,
       scenario_version: 1, status: 'COMPLETED', created_at: '2026-01-01T00:00:00Z',
@@ -277,20 +291,34 @@ describe('Shared new run labels', () => {
     }))
   })
 
-  it('hosts Chat controls beside the labels and removes them when navigating away', async () => {
+  it('hosts Chat controls below the labels and above the objective, and removes them when navigating away', async () => {
     const user = userEvent.setup()
+    jest.mocked(targetsApi.listTargets).mockResolvedValue({
+      items: [{ ...TARGET, supports_temperature_override: true }],
+      pagination: { limit: 200, has_more: false },
+    })
     renderApp('/chat')
-    const toolbar = within(currentLabels()).getByRole('group', { name: 'Chat controls' })
-    const targetPicker = await within(toolbar).findByRole('combobox', { name: 'Chat target' })
+    const toolbar = screen.getByRole('group', { name: 'Chat controls' })
+    expect(currentLabels()).not.toContainElement(toolbar)
+    expect(currentLabels().compareDocumentPosition(toolbar) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy()
+    expect(toolbar.compareDocumentPosition(screen.getByTestId('objective-header')) & Node.DOCUMENT_POSITION_FOLLOWING)
+      .toBeTruthy()
+    const settings = within(toolbar).getByRole('group', { name: 'Conversation settings' })
+    const actions = within(toolbar).getByRole('group', { name: 'Conversation actions' })
+    const targetPicker = await within(settings).findByRole('combobox', { name: 'Chat target' })
     await waitFor(() => expect(targetPicker).toBeEnabled())
     await user.selectOptions(targetPicker, 'test_target')
     expect(targetPicker).toHaveValue('test_target')
+    const temperature = within(settings).getByRole('spinbutton', { name: 'Temperature' })
+    await user.type(temperature, '0.7')
+    expect(temperature).toHaveValue(0.7)
+    expect(within(settings).getByRole('button', { name: 'Edit Conversation' })).toBeEnabled()
     expect(within(screen.getByTestId('chat-area')).queryByRole('group', { name: 'Chat controls' }))
       .not.toBeInTheDocument()
-    expect(within(toolbar).getByRole('button', { name: 'Export conversation' })).toBeDisabled()
-    expect(within(toolbar).getByRole('button', { name: 'Toggle conversations panel' })).toBeDisabled()
-    expect(within(toolbar).getByRole('button', { name: 'New Attack' })).toBeDisabled()
-    const markdown = within(toolbar).getByRole('switch')
+    expect(within(actions).getByRole('button', { name: 'Export conversation' })).toBeDisabled()
+    expect(within(actions).getByRole('button', { name: 'Toggle conversations panel' })).toBeDisabled()
+    expect(within(actions).getByRole('button', { name: 'New Attack' })).toBeDisabled()
+    const markdown = within(actions).getByRole('switch')
     await user.click(markdown)
     expect(readUserPreferences('local').chatMarkdown).toBe(true)
 
@@ -301,7 +329,7 @@ describe('Shared new run labels', () => {
     expect(screen.queryByRole('group', { name: 'Chat controls' })).not.toBeInTheDocument()
     await user.click(screen.getByRole('button', { name: 'Technique.execute', exact: true }))
     expect(screen.getAllByRole('group', { name: 'Chat controls' })).toHaveLength(1)
-    expect(within(currentLabels()).getByRole('switch')).toBeChecked()
+    expect(within(screen.getByRole('group', { name: 'Conversation actions' })).getByRole('switch')).toBeChecked()
   })
 
   it('preserves an edit made before the backend defaults arrive', async () => {
@@ -362,7 +390,7 @@ describe('Shared new run labels', () => {
     expect(attacksApi.createAttack).not.toHaveBeenCalled()
     expect(attacksApi.submitMessageSend).not.toHaveBeenCalled()
 
-    const toolbar = within(currentLabels()).getByRole('group', { name: 'Chat controls' })
+    const toolbar = screen.getByRole('group', { name: 'Chat controls' })
     expect(within(toolbar).getByLabelText('Active target: test_target')).toBeInTheDocument()
     await waitFor(() => expect(within(toolbar).getByRole('button', { name: 'Export conversation' })).toBeEnabled())
     await user.click(within(toolbar).getByRole('button', { name: 'Export conversation' }))

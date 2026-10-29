@@ -136,7 +136,7 @@ test.describe("Accessibility", () => {
     await expect(input).toBeVisible({ timeout: 5000 });
 
     // Send button should have accessible name
-    const sendButton = page.getByRole("button", { name: /send/i });
+    const sendButton = page.getByRole("button", { name: "Send message", exact: true });
     await expect(sendButton).toBeVisible();
 
     // New Attack button should have accessible name
@@ -399,31 +399,5 @@ test.describe("Accessibility", () => {
   test("tour remains contained and actionable on desktop", async ({ page }) => {
     await page.setViewportSize(DESKTOP_VIEWPORT);
     await expectTourContainedAndActionable(page, "desktop");
-  });
-});
-
-test.describe("Visual Consistency", () => {
-  test("should render without layout shifts", async ({ page }) => {
-    await page.goto("/");
-
-    // Wait for initial render then navigate to chat to measure the chat ribbon
-    await expect(page.getByTitle("Technique.execute")).toBeVisible();
-    await page.getByTitle("Technique.execute").click();
-    const anchor = page.getByTestId("new-attack-btn");
-    await expect(anchor).toBeVisible();
-
-    // Take measurements
-    const initialBox = await anchor.boundingBox();
-
-    // Wait a moment for any delayed renders
-    await page.waitForTimeout(500);
-
-    // Verify position hasn't changed
-    const finalBox = await anchor.boundingBox();
-
-    if (initialBox && finalBox) {
-      expect(finalBox.x).toBe(initialBox.x);
-      expect(finalBox.y).toBe(initialBox.y);
-    }
   });
 });

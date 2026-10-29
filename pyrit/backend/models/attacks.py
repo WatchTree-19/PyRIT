@@ -27,13 +27,15 @@ from pyrit.models import (
     AttackResult,
     ChatMessageRole,
     ConversationReference,
+    ConversationSummary,
     Message,
     MessagePiece,
     PromptDataType,
     PromptResponseError,
     Score,
 )
-from pyrit.models.results.attack_result import normalize_legacy_attack_attribution
+from pyrit.models.component_spec import RegisteredComponentReference, TargetBinding
+from pyrit.models.results.attack_result import ManualContinuation, ScoringFailure, normalize_legacy_attack_attribution
 
 
 class TargetInfo(BaseModel):
@@ -44,6 +46,7 @@ class TargetInfo(BaseModel):
     endpoint: str | None = Field(None, description="Target endpoint URL")
     model_name: str | None = Field(None, description="Model or deployment name")
     identifier_hash: str = Field(..., description="Canonical target identifier hash")
+    binding: TargetBinding | None = None
 
 
 class ScoreView(Score):
@@ -239,6 +242,19 @@ class AttackSummary(AttackResult[MessagePieceView, ScoreView]):
     created_at: datetime = Field(default_factory=lambda: datetime.now(UTC), description="Attack creation timestamp")
     updated_at: datetime = Field(default_factory=lambda: datetime.now(UTC), description="Last update timestamp")
 
+    chat_scorer: RegisteredComponentReference | None = Field(
+        default=None, description="Scorer for future manual responses"
+    )
+    chat_scorer_inherited: bool = Field(default=False, description="Uses the scan's registered original scorer")
+    execution_read_only: bool = Field(default=False, description="Execution changes require a manual continuation")
+
+    @computed_field
+    @property
+    def manual_continuation(self) -> ManualContinuation | None:
+        """The original automated conversation and handoff response, when this is a continuation."""
+        value = self.metadata.get(ManualContinuation.METADATA_KEY)
+        return ManualContinuation.model_validate(value) if value is not None else None
+
     @computed_field  # type: ignore[prop-decorator]
     @property
     def target_unbound(self) -> bool:
@@ -294,6 +310,7 @@ class AttackSummary(AttackResult[MessagePieceView, ScoreView]):
             endpoint=cast("str | None", target_id.params.get("endpoint") or None),
             model_name=cast("str | None", target_id.params.get("model_name") or None),
             identifier_hash=target_id.hash,
+            binding=TargetBinding.from_metadata(self.metadata),
         )
 
     @computed_field  # type: ignore[prop-decorator]
@@ -332,6 +349,7 @@ class ConversationMessagesResponse(BaseModel):
 
     conversation_id: str = Field(..., description="Conversation identifier")
     messages: list[MessageView] = Field(default_factory=list, description="All messages in order")
+    scoring_failure: ScoringFailure | None = None
     target_response_status: TargetResponseStatus | None = Field(
         default=None,
         description=(
@@ -339,6 +357,8 @@ class ConversationMessagesResponse(BaseModel):
             "None when the conversation does not end with a target response."
         ),
     )
+    pagination: PaginationInfo | None = None
+    partial_message_sequences: list[int] = Field(default_factory=list)
 
 
 # ============================================================================
@@ -388,6 +408,7 @@ class MessagePieceRequest(BaseModel):
         description="Registry IDs of converters already applied, in execution order, including duplicates. "
         "Requires converted_value. Use an empty list for manual edits.",
     )
+    applied_converter_provenance: list[str | None] | None = Field(None, max_length=MAX_ITEMS)
     mime_type: IdentifierStr | None = Field(None, description="MIME type for media content")
     prompt_metadata: dict[IdentifierStr, Any] | None = Field(
         None,
@@ -418,6 +439,11 @@ class MessagePieceRequest(BaseModel):
             raise ValueError("converted_value_data_type requires converted_value")
         if self.applied_converter_ids is not None and self.converted_value is None:
             raise ValueError("applied_converter_ids requires converted_value")
+        if self.applied_converter_provenance is not None and (
+            self.applied_converter_ids is None
+            or len(self.applied_converter_provenance) != len(self.applied_converter_ids)
+        ):
+            raise ValueError("applied_converter_provenance must match applied_converter_ids")
         return self
 
 
@@ -487,6 +513,8 @@ class CreateAttackRequest(_AttackAttributionInput):
     """
 
     name: TextStr | None = Field(None, description="Attack name/label")
+    target_binding: TargetBinding | None = None
+    chat_scorer: RegisteredComponentReference | None = None
     target_registry_name: IdentifierStr | None = Field(
         None, description="Target registry name, or None for a saved unbound attack"
     )
@@ -526,6 +554,8 @@ class UpdateAttackRequest(BaseModel):
         default=None,
         description="Updated attack outcome",
     )
+    chat_scorer: RegisteredComponentReference | None = None
+    default_chat_scorer: RegisteredComponentReference | None = None
     objective: TextStr | None = Field(default=None, description="Shared objective for all conversations in the attack")
     expected_objective: str | None = Field(
         default=None, description="Objective read before editing, for conflict detection"
@@ -539,7 +569,7 @@ class UpdateAttackRequest(BaseModel):
         Returns:
             UpdateAttackRequest: The validated request.
         """
-        if self.outcome is None and self.objective is None:
+        if self.outcome is None and self.objective is None and "chat_scorer" not in self.model_fields_set:
             raise ValueError("At least one mutable attack field must be supplied")
         if self.objective is not None:
             self.objective = self.objective.strip()
@@ -551,15 +581,6 @@ class UpdateAttackRequest(BaseModel):
 # ============================================================================
 
 
-class ConversationSummary(BaseModel):
-    """Summary of a conversation (message count, preview, timestamp)."""
-
-    conversation_id: str = Field(..., description="Unique conversation identifier")
-    message_count: int = Field(0, description="Number of messages in this conversation")
-    last_message_preview: str | None = Field(None, description="Preview of the last message")
-    created_at: datetime | None = Field(None, description="Timestamp of the first message")
-
-
 class AttackConversationsResponse(BaseModel):
     """Response listing all conversations belonging to an attack."""
 
@@ -568,6 +589,8 @@ class AttackConversationsResponse(BaseModel):
     conversations: list[ConversationSummary] = Field(
         default_factory=list, description="All conversations including main"
     )
+    pagination: PaginationInfo | None = None
+    total_count: int | None = None
 
 
 class CreateConversationRequest(BaseModel):
@@ -597,9 +620,11 @@ ConversationMessageRequest = MessageRequest
 
 
 class SaveConversationRequest(_AttackAttributionInput):
-    """Save a complete draft as a new conversation, without sending it."""
+    """Save a complete draft without sending it, optionally reusing unsent history."""
 
     save_id: uuid.UUID
+    chat_scorer: RegisteredComponentReference | None = None
+    default_chat_scorer: RegisteredComponentReference | None = None
     destination: Literal["same_attack", "new_attack"]
     attack_result_id: uuid.UUID | None = None
     source_attack_result_id: uuid.UUID | None = None
@@ -607,7 +632,10 @@ class SaveConversationRequest(_AttackAttributionInput):
     expected_objective: str | None = None
     objective: str | None = Field(None, description="Omit to keep the destination's objective unchanged")
     target_registry_name: IdentifierStr | None = None
+    target_binding: TargetBinding | None = None
     messages: list[MessageRequest] = Field(default_factory=list)
+    reuse_unsent_conversation: bool = False
+    expected_source_piece_ids: list[uuid.UUID] | None = None
 
     @model_validator(mode="after")
     def _validate_destination(self) -> "SaveConversationRequest":
@@ -621,6 +649,13 @@ class SaveConversationRequest(_AttackAttributionInput):
             raise ValueError("Same attack requires attack_result_id; New attack must not supply it")
         if (self.source_attack_result_id is None) != (self.source_conversation_id is None):
             raise ValueError("Both source attack and source conversation are required together")
+        if self.reuse_unsent_conversation and (
+            self.destination != "same_attack"
+            or self.source_attack_result_id != self.attack_result_id
+            or self.source_conversation_id is None
+            or self.expected_source_piece_ids is None
+        ):
+            raise ValueError("Reusing unsent history requires the same source attack and an expected piece snapshot")
         if self.objective is not None:
             self.objective = self.objective.strip()
         for message in self.messages:
@@ -689,6 +724,7 @@ class AddMessageRequest(MessageRequest):
         None,
         description="Target registry name. Required when send=True so the backend knows which target to use.",
     )
+    target_binding: TargetBinding | None = None
     converter_ids: list[IdentifierStr] | None = Field(
         None,
         max_length=MAX_ITEMS,

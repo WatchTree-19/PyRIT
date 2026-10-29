@@ -15,7 +15,9 @@ Route structure:
 import uuid
 
 from fastapi import APIRouter, HTTPException, Query, Request, status
+from starlette.concurrency import run_in_threadpool
 
+from pyrit.analytics import PairedOutcomeStatistics, compute_paired_outcome_statistics
 from pyrit.backend.models.common import MAX_ITEMS, CursorStr, IdentifierStr, LabelFilterStr, ProblemDetail
 from pyrit.backend.models.datasets import ScenarioDatasetLoadResponse
 from pyrit.backend.models.scenarios import (
@@ -29,7 +31,14 @@ from pyrit.backend.services.scenario_run_service import (
     get_scenario_run_service,
 )
 from pyrit.backend.services.scenario_service import get_scenario_service
-from pyrit.models import ScenarioQueueSnapshot, ScenarioResult, ScenarioRunProgress, ScenarioRunState
+from pyrit.models import (
+    ScenarioHierarchyNode,
+    ScenarioHierarchyProjection,
+    ScenarioQueueSnapshot,
+    ScenarioResult,
+    ScenarioRunProgress,
+    ScenarioRunState,
+)
 from pyrit.models.catalog import (
     RegisteredScenario,
     RunScenarioRequest,
@@ -375,6 +384,81 @@ async def get_scenario_run_progress(  # pyrit-async-suffix-exempt
     return progress
 
 
+@router.get(
+    "/runs/{scenario_result_id}/hierarchy",
+    response_model=ScenarioHierarchyProjection,
+    responses={
+        400: {"model": ProblemDetail, "description": "Invalid hierarchy cursor"},
+        404: {"model": ProblemDetail, "description": "Run not found"},
+    },
+)
+async def get_scenario_run_hierarchy(  # pyrit-async-suffix-exempt
+    *,
+    scenario_result_id: IdentifierStr,
+    max_nodes: int = Query(1000, ge=1, le=5000, description="Maximum nodes to assemble in the hierarchy tree"),
+    cursor: CursorStr | None = Query(None, description="Opaque root-page continuation cursor"),
+) -> ScenarioHierarchyProjection:
+    """
+    Get the bounded result hierarchy projection for a scenario run.
+
+    Returns:
+        ScenarioHierarchyProjection: Bounded hierarchy projection connecting orchestration parents,
+        target-facing children, and generic read-only conversations.
+    """
+    service = get_scenario_run_service()
+    try:
+        hierarchy = await service.get_run_hierarchy_async(
+            scenario_result_id=scenario_result_id, max_nodes=max_nodes, cursor=cursor
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
+    if hierarchy is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Scenario run '{scenario_result_id}' not found",
+        )
+    return hierarchy
+
+
+@router.get(
+    "/runs/{scenario_result_id}/hierarchy/nodes/{attack_result_id}",
+    response_model=ScenarioHierarchyNode,
+    responses={
+        400: {"model": ProblemDetail, "description": "Invalid child cursor"},
+        404: {"model": ProblemDetail, "description": "Node or run not found"},
+    },
+)
+async def get_scenario_run_hierarchy_node(  # pyrit-async-suffix-exempt
+    *,
+    scenario_result_id: IdentifierStr,
+    attack_result_id: IdentifierStr,
+    limit: int = Query(200, ge=1, le=500, description="Maximum ordered child references in this page"),
+    children_cursor: CursorStr | None = Query(None, description="Opaque ordered-child continuation cursor"),
+) -> ScenarioHierarchyNode:
+    """
+    Get single-node hierarchy details and generic conversation projections without full-run hydration.
+
+    Returns:
+        ScenarioHierarchyNode: The target node with resolved immediate children and conversations.
+    """
+    service = get_scenario_run_service()
+    try:
+        node = await service.get_run_hierarchy_node_async(
+            scenario_result_id=scenario_result_id,
+            attack_result_id=attack_result_id,
+            max_immediate_children=limit,
+            children_cursor=children_cursor,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
+    if node is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Hierarchy node '{attack_result_id}' not found in scenario run '{scenario_result_id}'",
+        )
+    return node
+
+
 @router.post(
     "/runs/{scenario_result_id}/cancel",
     response_model=ScenarioRunSummary,
@@ -437,3 +521,36 @@ async def get_scenario_run_results(scenario_result_id: IdentifierStr) -> Scenari
             detail=f"Scenario run '{scenario_result_id}' not found",
         )
     return result
+
+
+@router.get(
+    "/runs/{scenario_result_id}/paired-outcomes",
+    response_model=PairedOutcomeStatistics,
+    responses={
+        400: {"model": ProblemDetail, "description": "Selected groups cannot be compared"},
+        404: {"model": ProblemDetail, "description": "Run not found"},
+        409: {"model": ProblemDetail, "description": "Run not yet completed"},
+    },
+)
+async def get_paired_outcomes_async(
+    *,
+    scenario_result_id: IdentifierStr,
+    baseline_group_id: IdentifierStr = Query(..., description="Saved baseline atomic group ID"),
+    attack_group_id: IdentifierStr = Query(..., description="Saved attack atomic group ID"),
+) -> PairedOutcomeStatistics:
+    """
+    Compare explicitly selected groups using the SDK's effective outcome semantics.
+
+    Returns:
+        PairedOutcomeStatistics: Transitions, paired rates, and exclusions for a completed run.
+    """
+    result = await get_scenario_run_results(scenario_result_id=scenario_result_id)
+    try:
+        return await run_in_threadpool(
+            compute_paired_outcome_statistics,
+            result,
+            baseline_group_id=baseline_group_id,
+            attack_group_id=attack_group_id,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from None
