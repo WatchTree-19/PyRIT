@@ -3,11 +3,15 @@
 
 from __future__ import annotations
 
+import importlib
+import inspect
+from pathlib import Path
 from typing import Literal
 from unittest.mock import MagicMock
 
 import pytest
 
+import pyrit.score
 from pyrit.models import (
     ComponentIdentifier,
     Condition,
@@ -26,6 +30,7 @@ from pyrit.score import (
     LegacyScorerHookError,
     MessageTrueFalseScorer,
     ProgramExecutionScorer,
+    Scorer,
     ScorerPromptValidator,
     SelfAskGeneralFloatScaleScorer,
     SelfAskScaleScorer,
@@ -36,6 +41,32 @@ from pyrit.score.observation import execution
 from pyrit.score.observation.observation_source import ObservationSource
 
 pytestmark = pytest.mark.usefixtures("patch_central_database")
+
+
+def _concrete_in_repo_leaf_scorers() -> list[type[Scorer]]:
+    root = Path(pyrit.score.__file__).parent
+    for path in sorted(root.rglob("*.py")):
+        parts = path.relative_to(root).with_suffix("").parts
+        if parts[-1] == "__init__":
+            parts = parts[:-1]
+        importlib.import_module(".".join(("pyrit", "score", *parts)))
+    found: set[type[Scorer]] = set()
+    pending: list[type[Scorer]] = [Scorer]
+    while pending:
+        for subclass in pending.pop().__subclasses__():
+            if subclass not in found:
+                found.add(subclass)
+                pending.append(subclass)
+    return sorted(
+        (
+            scorer_type
+            for scorer_type in found
+            if scorer_type.__module__.startswith("pyrit.")
+            and not inspect.isabstract(scorer_type)
+            and not any("_get_child_scorers" in base.__dict__ for base in scorer_type.__mro__ if base is not Scorer)
+        ),
+        key=lambda scorer_type: f"{scorer_type.__module__}.{scorer_type.__qualname__}",
+    )
 
 
 class _TypedCondition(Condition):
@@ -156,6 +187,17 @@ class TestObjectiveScorersDeclareMatchesObjective:
 
 
 class TestScorableTypeDeclarations:
+    def test_every_in_repo_leaf_declares_message_evidence(self) -> None:
+        leaves = _concrete_in_repo_leaf_scorers()
+        undeclared = [
+            f"{scorer_type.__module__}.{scorer_type.__qualname__}"
+            for scorer_type in leaves
+            if MessageScorable not in scorer_type.SUPPORTED_SCORABLE_TYPES
+        ]
+
+        assert leaves
+        assert undeclared == []
+
     def test_adapted_legacy_scorer_declares_message_evidence(self) -> None:
         with pytest.warns(DeprecationWarning, match="Scorer.__init__"):
             scorer = _LegacyDirectScorer()
