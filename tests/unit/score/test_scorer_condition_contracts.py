@@ -101,6 +101,8 @@ class _TypedMessageScorer(MessageTrueFalseScorer):
     async def _score_piece_with_expectation_async(
         self, message_piece: MessagePiece, *, expectation: ScoringExpectation | None
     ) -> list[Score]:
+        condition = self._get_required_condition(expectation=expectation, condition_type=_TypedCondition)
+        assert condition.value == "typed"
         return _score_for(self, message_piece, expectation)
 
 
@@ -347,6 +349,23 @@ class TestInRepoScorersUseTypedHook:
                 self, message_piece: MessagePiece, *, objective: str | None = None
             ) -> list[Score]:
                 raise AssertionError("must not be silently skipped")
+
+        with pytest.raises(
+            LegacyScorerHookError, match="Move the custom policy to _score_piece_with_expectation_async"
+        ):
+            CustomSubstringScorer(substring="x")
+
+    def test_external_subclass_with_both_piece_hooks_fails_at_construction(self) -> None:
+        class CustomSubstringScorer(SubStringScorer):
+            async def _score_piece_async(
+                self, message_piece: MessagePiece, *, objective: str | None = None
+            ) -> list[Score]:
+                raise AssertionError("must not be silently skipped")
+
+            async def _score_piece_with_expectation_async(
+                self, message_piece: MessagePiece, *, expectation: ScoringExpectation | None
+            ) -> list[Score]:
+                raise AssertionError("construction must fail")
 
         with pytest.raises(
             LegacyScorerHookError, match="Move the custom policy to _score_piece_with_expectation_async"

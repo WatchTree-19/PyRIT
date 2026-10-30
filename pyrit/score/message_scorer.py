@@ -358,7 +358,7 @@ class MessageScorer(Scorer):
                 for cls in type(self).__mro__
                 if "_score_piece_async" in cls.__dict__ or "_score_piece_with_expectation_async" in cls.__dict__
             )
-            if "_score_piece_with_expectation_async" not in hook_owner.__dict__:
+            if "_score_piece_async" in hook_owner.__dict__:
                 raise LegacyScorerHookError(
                     f"{type(self).__name__} overrides _score_piece_async below an expectation-aware scorer. "
                     "Move the custom policy to _score_piece_with_expectation_async."
